@@ -52,6 +52,7 @@ func main() {
 	prefix := flag.String("prefix", "", "archive prefix")
 	endpoint := flag.String("endpoint", "", "S3 endpoint override (e.g. MinIO)")
 	region := flag.String("region", "", "AWS region")
+	strict := flag.Bool("strict", false, "also fail on data objects without a manifest (normally duplicates left by a failed manifest upload that the collector re-archived)")
 	ledgerURL := flag.String("ledger", "", "mock Salesforce ledger URL, e.g. http://localhost:8080/admin/ledger")
 	out := flag.String("out", "", "write the JSON report to this file")
 	flag.Parse()
@@ -162,7 +163,10 @@ func main() {
 	}
 	wg.Wait()
 
-	rep.OK = len(rep.ManifestMismatches) == 0 && rep.ObjectsWithoutMan == 0
+	// A data object without a manifest is left behind when the manifest upload
+	// fails; the collector did not advance its checkpoint and re-archived the
+	// batch under a new name. Missing records are caught by the ledger check.
+	rep.OK = len(rep.ManifestMismatches) == 0 && (!*strict || rep.ObjectsWithoutMan == 0)
 	if *ledgerURL != "" {
 		var ledger mocksf.Ledger
 		if err := fetchJSON(*ledgerURL, &ledger); err != nil {

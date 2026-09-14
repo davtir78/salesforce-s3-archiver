@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/davtir78/salesforce-s3-archiver/internal/config"
 	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/common"
@@ -48,7 +47,7 @@ type PubSubClient struct {
 	pubSubClient proto.PubSubClient
 
 	schemaMu    sync.Mutex
-	schemaCache map[string]*goavro.Codec
+	schemaCache map[string]*schemaEntry
 }
 
 type Options struct {
@@ -81,7 +80,7 @@ func NewGRPCClient(opts Options) (*PubSubClient, error) {
 		auth:         opts.Auth,
 		conn:         conn,
 		pubSubClient: proto.NewPubSubClient(conn),
-		schemaCache:  make(map[string]*goavro.Codec),
+		schemaCache:  make(map[string]*schemaEntry),
 	}, nil
 }
 
@@ -175,11 +174,11 @@ func (c *PubSubClient) GetSchema(ctx context.Context, schemaId string) (*proto.S
 // DecodeEvent decodes an event payload with its Avro schema. It returns the
 // flattened field map and the event type name (e.g. "LoginEventStream").
 func (c *PubSubClient) DecodeEvent(ctx context.Context, event *proto.ConsumerEvent) (map[string]any, string, error) {
-	codec, err := c.fetchCodec(ctx, event.GetEvent().GetSchemaId())
+	entry, err := c.fetchSchema(ctx, event.GetEvent().GetSchemaId())
 	if err != nil {
 		return nil, "", fmt.Errorf("fetching schema %s: %w", event.GetEvent().GetSchemaId(), err)
 	}
-	parsed, _, err := codec.NativeFromBinary(event.GetEvent().GetPayload())
+	parsed, _, err := entry.codec.NativeFromBinary(event.GetEvent().GetPayload())
 	if err != nil {
 		return nil, "", fmt.Errorf("decoding avro payload: %w", err)
 	}
@@ -187,14 +186,23 @@ func (c *PubSubClient) DecodeEvent(ctx context.Context, event *proto.ConsumerEve
 	if !ok {
 		return nil, "", fmt.Errorf("decoded payload is %T, not a record", parsed)
 	}
-	return FlattenAvro(body), shortTypeName(parseTypeName(codec)), nil
+	fields, err := entry.flattener.Flatten(body)
+	if err != nil {
+		return nil, "", fmt.Errorf("flattening avro record: %w", err)
+	}
+	return fields, shortTypeName(parseTypeName(entry.codec)), nil
 }
 
-func (c *PubSubClient) fetchCodec(ctx context.Context, schemaId string) (*goavro.Codec, error) {
+type schemaEntry struct {
+	codec     *goavro.Codec
+	flattener *Flattener
+}
+
+func (c *PubSubClient) fetchSchema(ctx context.Context, schemaId string) (*schemaEntry, error) {
 	c.schemaMu.Lock()
 	defer c.schemaMu.Unlock()
-	if codec, ok := c.schemaCache[schemaId]; ok {
-		return codec, nil
+	if entry, ok := c.schemaCache[schemaId]; ok {
+		return entry, nil
 	}
 	log.Debugf("Making GetSchema request for uncached schema %s", schemaId)
 	schema, err := c.GetSchema(ctx, schemaId)
@@ -205,8 +213,13 @@ func (c *PubSubClient) fetchCodec(ctx context.Context, schemaId string) (*goavro
 	if err != nil {
 		return nil, err
 	}
-	c.schemaCache[schemaId] = codec
-	return codec, nil
+	flattener, err := NewFlattener(schema.GetSchemaJson())
+	if err != nil {
+		return nil, err
+	}
+	entry := &schemaEntry{codec: codec, flattener: flattener}
+	c.schemaCache[schemaId] = entry
+	return entry, nil
 }
 
 func parseTypeName(codec *goavro.Codec) string {
@@ -224,60 +237,6 @@ func shortTypeName(fullName string) string {
 		return name
 	}
 	return "UnknownEvent"
-}
-
-// FlattenAvro converts goavro native values into plain JSON-friendly values.
-// Every field is kept: union wrappers ({"string": "x"}) are unwrapped
-// recursively, nulls stay null, and timestamps become Unix milliseconds.
-//
-// The upstream exporter only kept CreatedDate/CreatedById and union-typed
-// fields, silently dropping every other non-union field.
-func FlattenAvro(body map[string]any) map[string]any {
-	out := make(map[string]any, len(body))
-	for k, v := range body {
-		out[k] = flattenValue(v)
-	}
-	return out
-}
-
-func flattenValue(v any) any {
-	switch t := v.(type) {
-	case nil:
-		return nil
-	case map[string]any:
-		// A goavro union is a single-entry map keyed by the branch type name.
-		if len(t) == 1 {
-			for branch, inner := range t {
-				if isAvroBranchName(branch) {
-					return flattenValue(inner)
-				}
-			}
-		}
-		out := make(map[string]any, len(t))
-		for k, inner := range t {
-			out[k] = flattenValue(inner)
-		}
-		return out
-	case []any:
-		out := make([]any, len(t))
-		for i, inner := range t {
-			out[i] = flattenValue(inner)
-		}
-		return out
-	case time.Time:
-		return t.UnixMilli()
-	default:
-		return v
-	}
-}
-
-func isAvroBranchName(name string) bool {
-	switch name {
-	case "string", "long", "int", "double", "float", "boolean", "bytes", "array", "map":
-		return true
-	}
-	// Named types (records, enums, fixed) in unions are keyed by full name.
-	return strings.Contains(name, ".")
 }
 
 // getCerts returns the system cert pool, or an empty pool if unavailable.

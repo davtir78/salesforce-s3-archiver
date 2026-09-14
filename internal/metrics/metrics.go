@@ -55,6 +55,11 @@ var (
 		Help: "Subscription reconnects by reason.",
 	}, []string{"topic", "reason"})
 
+	LeaseHeld = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sfarchive_stream_lease_held",
+		Help: "1 while this process holds the checkpoint lease for the topic and is archiving it.",
+	}, []string{"topic"})
+
 	BufferedEvents = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "sfarchive_stream_buffered_events",
 		Help: "Events received but not yet durably archived.",
@@ -82,6 +87,9 @@ var (
 )
 
 var ready atomic.Bool
+
+// IsReady reports the readiness state served on /readyz.
+func IsReady() bool { return ready.Load() }
 
 // SetReady marks the process ready (e.g. all stream leases acquired).
 func SetReady(v bool) { ready.Store(v) }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/davtir78/salesforce-s3-archiver/internal/archive"
@@ -57,8 +58,9 @@ func RunService(ctx context.Context, conf *config.Config, sink archive.Sink, sto
 		wg       sync.WaitGroup
 		errOnce  sync.Once
 		firstErr error
-		started  sync.WaitGroup
+		active   atomic.Int32
 	)
+	total := int32(len(conf.EventStream.Topics))
 	for _, topic := range conf.EventStream.Topics {
 		client, closeFn, err := newClient()
 		if err != nil {
@@ -67,12 +69,20 @@ func RunService(ctx context.Context, conf *config.Config, sink archive.Sink, sto
 			return fmt.Errorf("creating Pub/Sub client for %s: %w", topic, err)
 		}
 		sub := NewSubscriber(OptionsFromConfig(conf, topic), client, sink, store)
+		// Ready only when every topic holds its lease, not merely when goroutines
+		// start: a collector waiting on another instance's lease archives nothing.
+		sub.OnActive = func(on bool) {
+			if on {
+				metrics.SetReady(active.Add(1) == total)
+			} else {
+				active.Add(-1)
+				metrics.SetReady(false)
+			}
+		}
 		wg.Add(1)
-		started.Add(1)
 		go func(topic string) {
 			defer wg.Done()
 			defer closeFn()
-			started.Done()
 			if err := sub.Run(ctx); err != nil {
 				log.Errorf("Topic %s stopped: %v", topic, err)
 				errOnce.Do(func() {
@@ -82,8 +92,6 @@ func RunService(ctx context.Context, conf *config.Config, sink archive.Sink, sto
 			}
 		}(topic)
 	}
-	started.Wait()
-	metrics.SetReady(true)
 	wg.Wait()
 	metrics.SetReady(false)
 	if firstErr != nil {
