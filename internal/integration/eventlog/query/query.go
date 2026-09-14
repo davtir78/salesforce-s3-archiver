@@ -84,7 +84,11 @@ func getJSON(ctx context.Context, conf *config.EventLogConfig, db cache.Cache, u
 	if resp.StatusCode != http.StatusOK {
 		return generateError(resp)
 	}
-	return json.NewDecoder(resp.Body).Decode(v)
+	// Keep numbers exact (json.Number) instead of float64, which loses
+	// precision above 2^53.
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	return dec.Decode(v)
 }
 
 // RequestLogFiles lists EventLogFile records created in [since, until],
@@ -132,10 +136,23 @@ func RequestLogFiles(ctx context.Context, conf *config.EventLogConfig, db cache.
 // download is verified against the advertised length; a partial file is
 // deleted and reported as an error.
 func DownloadCsvFile(ctx context.Context, conf *config.EventLogConfig, db cache.Cache, record *EventLogfileRecord, dir string) (string, error) {
-	// Large files: no overall timeout beyond ctx (requestTimeout applies to API calls).
-	resp, err := requestWithTimeout(ctx, conf, db, conf.Auth.TokenUrl+record.LogFile, 0, false)
+	// Large files may legitimately take longer than requestTimeout, so instead of
+	// an overall deadline the download is cancelled when no bytes arrive for
+	// the stall timeout (covering both the response headers and the body).
+	stall := time.Duration(conf.DownloadStallTimeoutSeconds) * time.Second
+	if stall <= 0 {
+		stall = DefaultDownloadStallTimeout
+	}
+	dlCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	watchdog := time.AfterFunc(stall, func() {
+		cancel(fmt.Errorf("no data received for %s", stall))
+	})
+	defer watchdog.Stop()
+
+	resp, err := requestWithTimeout(dlCtx, conf, db, conf.Auth.TokenUrl+record.LogFile, 0, false)
 	if err != nil {
-		return "", err
+		return "", withCause(dlCtx, err)
 	}
 	defer resp.Body.Close()
 
@@ -151,7 +168,9 @@ func DownloadCsvFile(ctx context.Context, conf *config.EventLogConfig, db cache.
 		return "", err
 	}
 	filePath := outFile.Name()
-	written, copyErr := io.Copy(outFile, resp.Body)
+	watchdog.Reset(stall)
+	written, copyErr := io.Copy(outFile, &progressReader{r: resp.Body, onProgress: func() { watchdog.Reset(stall) }})
+	copyErr = withCause(dlCtx, copyErr)
 	closeErr := outFile.Close()
 	if copyErr == nil {
 		copyErr = closeErr
@@ -167,6 +186,33 @@ func DownloadCsvFile(ctx context.Context, conf *config.EventLogConfig, db cache.
 		return "", fmt.Errorf("downloading log file %s: %w", record.Id, copyErr)
 	}
 	return filePath, nil
+}
+
+// DefaultDownloadStallTimeout cancels an EventLogFile download that receives no data for this long.
+const DefaultDownloadStallTimeout = 120 * time.Second
+
+type progressReader struct {
+	r          io.Reader
+	onProgress func()
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.onProgress()
+	}
+	return n, err
+}
+
+// withCause reports why a context was cancelled (e.g. the stall watchdog).
+func withCause(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
+		return fmt.Errorf("%w: %v", err, cause)
+	}
+	return err
 }
 
 // RequestCustomQuery runs a custom SOQL query for [since, until], following every page.

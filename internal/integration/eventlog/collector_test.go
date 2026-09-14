@@ -3,6 +3,7 @@ package eventlog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -126,7 +127,7 @@ func TestArchivesEventLogFilesAcrossPages(t *testing.T) {
 	h.assertNoTempFiles()
 
 	// Watermark is the newest CreatedDate; a second poll archives nothing new.
-	if _, ok := h.c.watermark(h.c.logFilesWatermarkKey()); !ok {
+	if _, ok, _ := h.c.watermark(h.c.logFilesWatermarkKey()); !ok {
 		t.Fatal("watermark not stored")
 	}
 	if err := h.c.Poll(context.Background()); err != nil {
@@ -162,7 +163,7 @@ func TestEventLogFailuresDoNotAdvanceWatermark(t *testing.T) {
 	if len(h.sink.Keys()) != 0 {
 		t.Errorf("nothing should be archived after the first file failed")
 	}
-	if _, ok := h.c.watermark(h.c.logFilesWatermarkKey()); ok {
+	if _, ok, _ := h.c.watermark(h.c.logFilesWatermarkKey()); ok {
 		t.Errorf("watermark must not be set when the first file failed")
 	}
 	h.assertNoTempFiles()
@@ -180,7 +181,7 @@ func TestEventLogFailuresDoNotAdvanceWatermark(t *testing.T) {
 	if n := len(h.sink.Keys()); n != 3 {
 		t.Errorf("expected 3 archived files before the failure, got %d", n)
 	}
-	wm, ok := h.c.watermark(h.c.logFilesWatermarkKey())
+	wm, ok, _ := h.c.watermark(h.c.logFilesWatermarkKey())
 	if !ok || !wm.Before(base.Add(3*time.Minute)) {
 		t.Errorf("watermark %v advanced past the failed file", wm)
 	}
@@ -296,13 +297,13 @@ func TestCustomQueriesPaginateDedupeAndRetry(t *testing.T) {
 
 	// A failed query leaves the watermark alone; new rows arrive next poll.
 	key := h.c.queryWatermarkKey(&h.conf.CustomQueries[0])
-	wmBefore, _ := h.c.watermark(key)
+	wmBefore, _, _ := h.c.watermark(key)
 	h.mock.AddCustomRecords("SetupAuditTrail", time.Now().Add(-2*time.Second), 5)
 	h.mock.SetFaults(mocksf.Faults{FailRestRequests: 1})
 	if err := h.c.Poll(context.Background()); err == nil {
 		t.Fatal("expected query failure")
 	}
-	if wmAfter, _ := h.c.watermark(key); !wmAfter.Equal(wmBefore) {
+	if wmAfter, _, _ := h.c.watermark(key); !wmAfter.Equal(wmBefore) {
 		t.Errorf("watermark moved after a failed query")
 	}
 	if err := h.c.Poll(context.Background()); err != nil {
@@ -365,3 +366,107 @@ func TestBuildCsvRecordFromSample(t *testing.T) {
 type recordCollector func(archive.Record)
 
 func (f recordCollector) WriteRecord(r archive.Record) error { f(r); return nil }
+
+func TestMalformedFileIsQuarantinedAfterRetries(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.MalformedFileAttempts = 3
+	base := time.Now().Add(-20 * time.Minute)
+	h.mock.AddEventLogFile("Login", base, 10)
+	bad := h.mock.AddEventLogFileRaw("Login", base.Add(time.Minute), []byte("EVENT_TYPE,REQUEST_ID\nLogin,a,unexpected-extra\nLogin,b\n"), "")
+	h.mock.AddEventLogFile("Login", base.Add(2*time.Minute), 10)
+
+	// Attempts 1 and 2 fail and hold the watermark before the bad file.
+	for attempt := 1; attempt <= 2; attempt++ {
+		err := h.c.Poll(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "malformed CSV") {
+			t.Fatalf("attempt %d: expected malformed CSV error, got %v", attempt, err)
+		}
+		if n := len(h.sink.Keys()); n != 1 {
+			t.Fatalf("attempt %d: only the file before the bad one may be archived, got %d objects", attempt, n)
+		}
+	}
+
+	// Attempt 3 quarantines the raw file and processing continues.
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatalf("quarantine poll failed: %v", err)
+	}
+	var quarantine string
+	for _, k := range h.sink.Keys() {
+		if strings.Contains(k, "elf-"+bad+"-quarantine") {
+			quarantine = k
+		}
+	}
+	if quarantine == "" {
+		t.Fatalf("no quarantine object in %v", h.sink.Keys())
+	}
+	m, _ := h.sink.Manifest(quarantine)
+	if m.RecordCount != 3 || m.Lineage["quarantineReason"] == "" {
+		t.Errorf("quarantine manifest wrong: %+v", m)
+	}
+	if missing := h.missingRows(); missing != 0 {
+		t.Errorf("%d rows from good files missing after quarantine", missing)
+	}
+	// Watermark moved past the quarantined file; nothing is reprocessed.
+	before := len(h.sink.Keys())
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.sink.Keys()) != before {
+		t.Errorf("quarantined file was processed again")
+	}
+}
+
+func TestUnparseableLogDateKeepsKeyStable(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	created := time.Now().Add(-10 * time.Minute)
+	h.mock.AddEventLogFileRaw("API", created, []byte("EVENT_TYPE,REQUEST_ID\nAPI,x\n"), "not-a-date")
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := h.sink.Keys()
+	h.db.Clear() // forget processed markers and watermark: reprocess
+	// Reprocess three hours later: a partition derived from "now" would change.
+	h.c.now = func() time.Time { return time.Now().Add(3 * time.Hour) }
+	h.conf.InitialTimeInterval = config.TimeIntervalConfig{Hours: 5}
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.sink.Keys(); len(got) != 1 || got[0] != first[0] {
+		t.Errorf("reprocessing must overwrite the same key; before %v after %v", first, got)
+	}
+}
+
+func TestWatermarkReadErrorFailsPoll(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.mock.AddEventLogFile("Login", time.Now().Add(-5*time.Minute), 5)
+	h.db.Err = errors.New("redis unavailable")
+	err := h.c.Poll(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "reading watermark") {
+		t.Fatalf("expected a watermark read error, got %v", err)
+	}
+	if n := len(h.sink.Keys()); n != 0 {
+		t.Errorf("nothing may be archived when the watermark cannot be read, got %d", n)
+	}
+}
+
+func TestSoqlLargeNumbersAreExact(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.SkipLogFiles = true
+	h.conf.CustomQueries = []config.QueryConfig{{
+		Soql:      config.SoqlConfig{Select: []string{"Id", "BigNumber", "CreatedDate"}, From: "SetupAuditTrail"},
+		ApiVer:    "64.0",
+		ApiName:   "rest",
+		Timestamp: "CreatedDate",
+	}}
+	h.mock.AddCustomRecords("SetupAuditTrail", time.Now().Add(-time.Minute), 1)
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lines, _ := h.sink.Lines()
+	if len(lines) != 1 {
+		t.Fatalf("expected one row, got %d", len(lines))
+	}
+	if got := fmt.Sprint(lines[0].Attributes["BigNumber"]); got != "9007199254740993" {
+		t.Errorf("BigNumber = %s, want 9007199254740993 (float64 would round it)", got)
+	}
+}
