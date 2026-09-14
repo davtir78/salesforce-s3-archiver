@@ -86,3 +86,6 @@ cmd/nr-salesforce-eventlog/nr-salesforce-eventlog
 cmd/nr-salesforce-stream/nr-salesforce-stream
 ./nr-salesforce-eventlog
 ./nr-salesforce-stream
+
+# Local development artefacts
+dev/
