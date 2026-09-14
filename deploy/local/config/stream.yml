@@ -1,0 +1,40 @@
+version: "3.0"
+logLevel: info
+metricsAddr: ":9090"
+
+eventStream:
+  instanceName: local
+  auth:
+    tokenUrl: http://mock-salesforce:8080
+    clientCred:
+      clientId: $SF_CLIENT_ID
+      clientSecret: $SF_CLIENT_SECRET
+  cache:
+    redis:
+      host: valkey
+      port: 6379
+      password: $REDIS_PASSWORD
+      tls:
+        enabled: true
+        caFile: /certs/ca.crt
+  pubsubEndpoint: mock-salesforce:7011
+  pubsubInsecure: true
+  # Bootstraps an empty checkpoint store from the start of the retention window.
+  initialReplay: EARLIEST
+  appetite: 200
+  leaseTtlSeconds: 15
+  batch:
+    maxEvents: 1000
+    maxAgeSeconds: 5
+  topics:
+    - /event/LoginEventStream
+    - /event/ApiEventStream
+
+archive:
+  s3:
+    bucket: archive
+    prefix: local
+    endpoint: http://minio:9000
+    forcePathStyle: true
+    region: us-east-1
+    uploadTimeoutSeconds: 20

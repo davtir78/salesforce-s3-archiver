@@ -1,0 +1,119 @@
+# Local stack: mock Salesforce, Valkey (TLS + AUTH), MinIO (S3) and both collectors.
+#
+#   sh scripts/dev-certs.sh                       # once, creates dev/certs
+#   docker compose -f deploy/local/docker-compose.yml up -d --build
+#   sh scripts/chaos-local.sh                     # optional chaos + reconciliation
+name: sf-archive
+
+x-collector: &collector
+  image: salesforce-s3-archiver:local
+  restart: unless-stopped
+  environment: &collector-env
+    LOG_LEVEL: info
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    AWS_REGION: us-east-1
+    SF_CLIENT_ID: mock-client-id
+    SF_CLIENT_SECRET: mock-client-secret
+    REDIS_PASSWORD: devpass
+  volumes:
+    - ./config:/config:ro
+    - ../../dev/certs:/certs:ro
+  depends_on:
+    mock-salesforce:
+      condition: service_started
+    valkey:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+
+services:
+  build:
+    image: salesforce-s3-archiver:local
+    build:
+      context: ../..
+      args:
+        VERSION: local
+    command: ["true"]
+    restart: "no"
+
+  mock-salesforce:
+    image: salesforce-s3-archiver:local
+    command: ["mock-salesforce", "-base-url", "http://mock-salesforce:8080", "-keepalive", "5s"]
+    ports:
+      - "18080:8080"
+    depends_on:
+      build:
+        condition: service_completed_successfully
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    command:
+      - valkey-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /certs/server.crt
+      - --tls-key-file
+      - /certs/server.key
+      - --tls-ca-cert-file
+      - /certs/ca.crt
+      - --tls-auth-clients
+      - "no"
+      - --requirepass
+      - devpass
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - "yes"
+    volumes:
+      - ../../dev/certs:/certs:ro
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "--tls", "--cacert", "/certs/ca.crt", "-a", "devpass", "--no-auth-warning", "ping"]
+      interval: 2s
+      retries: 30
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      retries: 30
+
+  minio-init:
+    image: quay.io/minio/minio:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mc alias set local http://minio:9000 minioadmin minioadmin && mc mb --ignore-existing local/archive
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+  stream-collector:
+    <<: *collector
+    command: ["sf-archive-stream", "-config", "/config/stream.yml"]
+    ports:
+      - "19091:9090"
+
+  eventlog-collector:
+    <<: *collector
+    command: ["sf-archive-eventlog", "-config", "/config/eventlog.yml"]
+    ports:
+      - "19092:9090"
+
+volumes:
+  valkey-data:
+  minio-data:
