@@ -13,15 +13,15 @@ TAG="$(git rev-parse --short HEAD)"
 
 terraform init -input=false >/dev/null
 echo "==> creating ECR repository"
-terraform apply -input=false -auto-approve -target=aws_ecr_repository.this $TF_VARS
+terraform apply -no-color -input=false -auto-approve -target=aws_ecr_repository.this $TF_VARS
 
 REPO="$(terraform output -raw ecr_repository_url)"
-REGION="$(terraform output -raw region)"
+REGION="${AWS_REGION:-ap-southeast-2}"
 echo "==> building and pushing ${REPO}:${TAG}"
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${REPO%%/*}"
 docker build --platform linux/amd64 --build-arg VERSION="$TAG" -t "${REPO}:${TAG}" ../..
 docker push "${REPO}:${TAG}"
 
 echo "==> applying stack"
-terraform apply -input=false -auto-approve $TF_VARS -var image_tag="$TAG"
+terraform apply -no-color -input=false -auto-approve $TF_VARS -var image_tag="$TAG"
 terraform output
