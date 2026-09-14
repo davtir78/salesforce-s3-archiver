@@ -89,3 +89,9 @@ cmd/nr-salesforce-stream/nr-salesforce-stream
 
 # Local development artefacts
 dev/
+
+# Terraform
+deploy/aws/.terraform/
+deploy/aws/*.tfstate
+deploy/aws/*.tfstate.*
+deploy/aws/*.tfvars
