@@ -258,6 +258,10 @@ resource "aws_ecs_service" "mock" {
   task_definition = aws_ecs_task_definition.mock[0].arn
   desired_count   = 1
   launch_type     = "FARGATE"
+  # Never run two mocks at once: Cloud Map would return both and collectors
+  # could read from a mock whose ledger is about to disappear.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
   network_configuration {
     subnets          = local.network.subnets
     security_groups  = local.network.security_groups

@@ -62,10 +62,12 @@ while [ $SECONDS -lt $end ]; do
   case "${ACTIONS[$((RANDOM % ${#ACTIONS[@]}))]}" in
     stop-stream)
       t=$(task_of stream-collector)
+      [ "$t" = "None" ] && { log "stream-collector has no running task (replacement starting); skipping"; continue; }
       log "stop stream-collector task ${t##*/} (SIGTERM, ECS replaces it)"
       aws ecs stop-task --cluster "$CLUSTER" --task "$t" --reason chaos >/dev/null ;;
     stop-eventlog)
       t=$(task_of eventlog-collector)
+      [ "$t" = "None" ] && { log "eventlog-collector has no running task; skipping"; continue; }
       log "stop eventlog-collector task ${t##*/}"
       aws ecs stop-task --cluster "$CLUSTER" --task "$t" --reason chaos >/dev/null ;;
     failover)
