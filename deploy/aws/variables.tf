@@ -70,3 +70,9 @@ variable "force_destroy" {
   type        = bool
   default     = true
 }
+
+variable "cache_snapshot_retention_days" {
+  description = "Automatic ElastiCache snapshot retention. Test stacks use 0 because automatic snapshots can outlive a destroyed replication group."
+  type        = number
+  default     = 0
+}

@@ -80,7 +80,7 @@ resource "aws_elasticache_replication_group" "this" {
   port                       = 6379
   parameter_group_name       = aws_elasticache_parameter_group.this.name
   apply_immediately          = true
-  snapshot_retention_limit   = 1
+  snapshot_retention_limit   = var.cache_snapshot_retention_days
 }
 
 resource "aws_elasticache_parameter_group" "this" {
