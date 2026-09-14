@@ -84,34 +84,40 @@ func (c *Collector) overlap() time.Duration {
 
 // since returns the query start for a watermark key: watermark minus overlap,
 // or the initial interval when no watermark exists.
-func (c *Collector) since(key string) (time.Time, *time.Time) {
-	if wm, ok := c.watermark(key); ok {
-		return wm.Add(-c.overlap()), &wm
+func (c *Collector) since(key string) (time.Time, *time.Time, error) {
+	wm, ok, err := c.watermark(key)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	if ok {
+		return wm.Add(-c.overlap()), &wm, nil
 	}
 	interval := c.conf.InitialTimeInterval
 	d := time.Duration(interval.Hours)*time.Hour + time.Duration(interval.Minutes)*time.Minute
 	if d == 0 {
 		d = time.Hour
 	}
-	return c.now().Add(-d), nil
+	return c.now().Add(-d), nil, nil
 }
 
-func (c *Collector) watermark(key string) (time.Time, bool) {
+// watermark returns the stored watermark. A cache read error is returned
+// rather than treated as "no watermark": falling back to the initial interval
+// would move the watermark forward past records that were never read.
+func (c *Collector) watermark(key string) (time.Time, bool, error) {
 	val, err := c.db.GetCacheVal(key)
 	if err != nil {
-		log.Warnf("Error reading watermark '%s' (continuing with initial interval): %v", key, err)
-		return time.Time{}, false
+		metrics.EventLogFailures.WithLabelValues("watermark").Inc()
+		return time.Time{}, false, fmt.Errorf("reading watermark '%s': %w", key, err)
 	}
 	s, ok := val.(string)
 	if !ok || s == "" {
-		return time.Time{}, false
+		return time.Time{}, false, nil
 	}
 	ms, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		log.Warnf("Invalid watermark '%s' = %q, ignoring", key, s)
-		return time.Time{}, false
+		return time.Time{}, false, fmt.Errorf("invalid watermark '%s' = %q: fix or delete the key", key, s)
 	}
-	return time.UnixMilli(ms), true
+	return time.UnixMilli(ms), true, nil
 }
 
 func (c *Collector) setWatermark(key string, t time.Time) {
@@ -147,7 +153,10 @@ func (c *Collector) markProcessed(key string) {
 
 func (c *Collector) collectLogFiles(ctx context.Context) error {
 	key := c.logFilesWatermarkKey()
-	since, current := c.since(key)
+	since, current, err := c.since(key)
+	if err != nil {
+		return err
+	}
 	// SOQL datetimes have second precision; use the same precision for the
 	// upper bound and the watermark so records in the boundary second are
 	// not excluded by the query yet covered by the watermark.
@@ -174,7 +183,7 @@ func (c *Collector) collectLogFiles(ctx context.Context) error {
 		}
 		pkey := c.processedKey(rec.Id)
 		if !c.isProcessed(pkey) {
-			if err := c.archiveLogFile(ctx, rec); err != nil {
+			if err := c.archiveLogFile(ctx, rec, created); err != nil {
 				// Stop here: never move the watermark past a file that failed.
 				if newWatermark.After(time.Time{}) {
 					c.setWatermark(key, newWatermark)
@@ -197,7 +206,7 @@ func (c *Collector) collectLogFiles(ctx context.Context) error {
 	return nil
 }
 
-func (c *Collector) archiveLogFile(ctx context.Context, rec *query.EventLogfileRecord) error {
+func (c *Collector) archiveLogFile(ctx context.Context, rec *query.EventLogfileRecord, created time.Time) error {
 	path, err := query.DownloadCsvFile(ctx, c.conf, c.db, rec, c.DownloadDir)
 	if err != nil {
 		metrics.EventLogFailures.WithLabelValues("download").Inc()
@@ -209,9 +218,12 @@ func (c *Collector) archiveLogFile(ctx context.Context, rec *query.EventLogfileR
 		}
 	}()
 
+	// The partition must be stable across reprocessing, otherwise elf-<Id>
+	// would land under a different key and no longer be idempotent.
 	logDate, err := parseSFDate(rec.LogDate)
 	if err != nil {
-		logDate = c.now()
+		log.Warnf("EventLogFile %s has unparseable LogDate %q; partitioning by CreatedDate", rec.Id, rec.LogDate)
+		logDate = created
 	}
 	meta := archive.ObjectMeta{
 		Source:        archive.SourceEventLog,
@@ -233,6 +245,10 @@ func (c *Collector) archiveLogFile(ctx context.Context, rec *query.EventLogfileR
 	m, err := c.sink.Write(ctx, meta, func(w archive.RecordWriter) error {
 		return streamCsv(path, rec.EventType, mapping, w)
 	})
+	var malformed *malformedCsvError
+	if errors.As(err, &malformed) {
+		return c.handleMalformed(ctx, rec, meta, path, malformed)
+	}
 	if err != nil {
 		metrics.EventLogFailures.WithLabelValues("archive").Inc()
 		metrics.UploadFailures.WithLabelValues(archive.SourceEventLog).Inc()
@@ -274,7 +290,7 @@ func streamCsv(path, eventType string, mapping FieldMapping, w archive.RecordWri
 		return nil // empty file
 	}
 	if err != nil {
-		return fmt.Errorf("reading CSV header: %w", err)
+		return &malformedCsvError{line: 1, err: err}
 	}
 	labels := append([]string(nil), header...)
 	reader.FieldsPerRecord = len(labels)
@@ -285,7 +301,7 @@ func streamCsv(path, eventType string, mapping FieldMapping, w archive.RecordWri
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("reading CSV line %d: %w", line, err)
+			return &malformedCsvError{line: line, err: err}
 		}
 		if err := w.WriteRecord(buildCsvRecord(labels, row, eventType, mapping)); err != nil {
 			return err
@@ -333,7 +349,10 @@ func (c *Collector) queryWatermarkKey(q *config.QueryConfig) string {
 
 func (c *Collector) collectCustomQuery(ctx context.Context, q *config.QueryConfig) error {
 	key := c.queryWatermarkKey(q)
-	since, _ := c.since(key)
+	since, _, err := c.since(key)
+	if err != nil {
+		return err
+	}
 	// SOQL datetimes have second precision; use the same precision for the
 	// upper bound and the watermark so records in the boundary second are
 	// not excluded by the query yet covered by the watermark.

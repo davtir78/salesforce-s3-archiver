@@ -87,9 +87,10 @@ func run() int {
 // Any events between the old checkpoint and the new start point must be
 // recovered another way (EventLogFiles or stored event objects).
 func resetCheckpoints(ctx context.Context, conf *config.Config, store checkpoint.Store, topicsArg string, confirm bool) int {
-	topics := conf.EventStream.Topics
-	if topicsArg != "all" {
-		topics = strings.Split(topicsArg, ",")
+	topics, err := resolveResetTopics(conf.EventStream.Topics, topicsArg)
+	if err != nil {
+		log.Errorf("%v", err)
+		return 2
 	}
 	if !confirm {
 		log.Errorf("Refusing to reset checkpoints for %v without -confirm. This can create a gap in the archive.", topics)
@@ -124,4 +125,36 @@ func resetCheckpoints(ctx context.Context, conf *config.Config, store checkpoint
 	}
 	log.Infof("Reset complete. Start the collector with eventStream.initialReplay set to EARLIEST or LATEST.")
 	return 0
+}
+
+// resolveResetTopics validates -reset-checkpoints arguments against the
+// configured topics, so a typo cannot silently "succeed" while the real
+// checkpoint is left in place.
+func resolveResetTopics(configured []string, arg string) ([]string, error) {
+	if strings.TrimSpace(arg) == "all" {
+		return configured, nil
+	}
+	known := map[string]bool{}
+	for _, t := range configured {
+		known[t] = true
+	}
+	var topics, unknown []string
+	for _, t := range strings.Split(arg, ",") {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if !known[t] {
+			unknown = append(unknown, t)
+			continue
+		}
+		topics = append(topics, t)
+	}
+	if len(unknown) > 0 {
+		return nil, fmt.Errorf("unknown topic(s) %v: -reset-checkpoints only accepts topics configured in eventStream.topics %v (or \"all\")", unknown, configured)
+	}
+	if len(topics) == 0 {
+		return nil, fmt.Errorf("no topics given to -reset-checkpoints")
+	}
+	return topics, nil
 }

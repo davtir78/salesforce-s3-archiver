@@ -19,6 +19,9 @@ import (
 )
 
 const (
+	// MaxAppetite is the largest num_requested the Pub/Sub API accepts.
+	MaxAppetite = 100
+
 	ReplayEarliest = "EARLIEST"
 	ReplayLatest   = "LATEST"
 
@@ -81,7 +84,11 @@ type SubscriberOptions struct {
 
 func (o *SubscriberOptions) defaults() {
 	if o.Appetite <= 0 {
-		o.Appetite = 100
+		o.Appetite = MaxAppetite
+	}
+	if o.Appetite > MaxAppetite {
+		log.Warnf("appetite %d exceeds the Pub/Sub API maximum of %d events per FetchRequest; using %d", o.Appetite, MaxAppetite, MaxAppetite)
+		o.Appetite = MaxAppetite
 	}
 	if o.MaxEvents <= 0 {
 		o.MaxEvents = 1000
@@ -116,6 +123,10 @@ type Subscriber struct {
 		Warn(string, ...any)
 		Error(string, ...any)
 	}
+
+	// OnActive is called with true once the lease is held and the checkpoint
+	// loaded (the subscriber is about to archive), and false when Run returns.
+	OnActive func(active bool)
 
 	lease checkpoint.Lease
 	// Last committed replay ID (nil until the first commit when bootstrapping).
@@ -175,6 +186,13 @@ func (s *Subscriber) Run(ctx context.Context) error {
 		s.logger.Warn("No checkpoint found; bootstrapping subscription", "initialReplay", s.opts.InitialReplay)
 	}
 
+	if s.OnActive != nil {
+		s.OnActive(true)
+		defer s.OnActive(false)
+	}
+	metrics.LeaseHeld.WithLabelValues(s.opts.Topic).Set(1)
+	defer metrics.LeaseHeld.WithLabelValues(s.opts.Topic).Set(0)
+
 	renewStop := make(chan struct{})
 	renewErr := make(chan error, 1)
 	go s.renewLease(ctx, renewStop, renewErr)
@@ -184,6 +202,11 @@ func (s *Subscriber) Run(ctx context.Context) error {
 	for {
 		err := s.session(ctx, renewErr)
 		if ctx.Err() != nil {
+			// Shutting down. A fatal error here means the final flush or commit
+			// failed; report it so the process exits non-zero.
+			if IsFatal(err) {
+				return err
+			}
 			return nil
 		}
 		if IsFatal(err) {

@@ -14,6 +14,7 @@ import (
 	"github.com/davtir78/salesforce-s3-archiver/internal/checkpoint"
 	"github.com/davtir78/salesforce-s3-archiver/internal/config"
 	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/grpcclient"
+	"github.com/davtir78/salesforce-s3-archiver/internal/metrics"
 	"github.com/davtir78/salesforce-s3-archiver/internal/mocksf"
 )
 
@@ -580,5 +581,75 @@ func TestShutdownDuringFlushStillCommits(t *testing.T) {
 	}
 	if missing, dups, _ := h.reconcile(); missing != 0 || dups != 0 {
 		t.Errorf("missing=%d duplicates=%d", missing, dups)
+	}
+}
+
+func TestShutdownFlushFailureIsReported(t *testing.T) {
+	h := newHarness(t, mocksf.Options{})
+	opts := h.options()
+	opts.MaxEvents = 10000
+	opts.MaxAge = time.Hour
+	_, stop := h.run(opts, h.store)
+	h.publish(20)
+	time.Sleep(500 * time.Millisecond) // buffered, not flushed
+	h.sink.BeforeStore = func(archive.ObjectMeta, int) error { return archive.ErrInjected }
+	err := stop()
+	if err == nil || !IsFatal(err) {
+		t.Fatalf("a failed final flush must be reported, got %v", err)
+	}
+	if _, ok := h.store.Checkpoint(h.key); ok {
+		t.Errorf("checkpoint must not be written when the final flush failed")
+	}
+}
+
+func TestReadinessWaitsForEveryLease(t *testing.T) {
+	topics := []string{"/event/LoginEventStream", "/event/ApiEventStream"}
+	h := newHarness(t, mocksf.Options{Topics: topics})
+	o := h.mock.Options()
+	conf := &config.Config{
+		EventStream: &config.EventStreamConfig{
+			Name:            "test",
+			Topics:          topics,
+			InitialReplay:   ReplayEarliest,
+			LeaseTTLSeconds: 3,
+			Auth: config.AuthConfig{
+				TokenUrl:   h.httpURL,
+				ClientCred: &config.ClientCredAuth{ClientId: o.ClientId, ClientSecret: o.ClientSecret},
+			},
+			PubSubEndpoint: h.grpcAddr,
+			PubSubInsecure: true,
+		},
+	}
+
+	// Another collector holds the lease for one topic.
+	other := h.store.Share()
+	blocked, err := other.Acquire(context.Background(), checkpoint.Key("test", topics[1]), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- RunService(ctx, conf, h.sink, h.store, DefaultClientFactory(conf)) }()
+
+	time.Sleep(700 * time.Millisecond)
+	if metrics.IsReady() {
+		t.Errorf("must not be ready while a topic lease is held elsewhere")
+	}
+
+	blocked.Release(context.Background())
+	deadline := time.Now().Add(5 * time.Second)
+	for !metrics.IsReady() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !metrics.IsReady() {
+		t.Errorf("expected ready once every lease is held")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if metrics.IsReady() {
+		t.Errorf("must not be ready after shutdown")
 	}
 }

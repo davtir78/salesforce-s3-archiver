@@ -50,8 +50,8 @@ type RedisConfig struct {
 	DbNumber uint   `mapstructure:"dbNumber"`
 	Username string `mapstructure:"username"`
 	Password string `mapstructure:"password"`
-	// Expiry for tokens and de-duplication markers only. Watermarks and
-	// stream replay checkpoints never expire.
+	// Expiry for tokens and de-duplication markers only (default 7 days).
+	// Watermarks and stream replay checkpoints never expire.
 	ExpireDays uint `mapstructure:"expireDays"`
 	// "standalone" (default, also ElastiCache cluster-mode-disabled) or "cluster".
 	Mode                string             `mapstructure:"mode"`
@@ -181,6 +181,12 @@ type EventLogConfig struct {
 	// Minutes subtracted from watermarks on each poll so late-arriving
 	// records are not skipped (default 60). Duplicates are removed downstream.
 	WatermarkOverlapMinutes uint `mapstructure:"watermarkOverlapMinutes"`
+	// Cancel an EventLogFile download that receives no data for this many
+	// seconds (default 120). Downloads have no overall timeout.
+	DownloadStallTimeoutSeconds uint `mapstructure:"downloadStallTimeoutSeconds"`
+	// Polls a file may fail CSV parsing before its raw lines are archived to a
+	// quarantine object and processing moves past it (default 3).
+	MalformedFileAttempts int `mapstructure:"malformedFileAttempts"`
 	// Records per archived object for custom queries (default 10000).
 	RecordsPerObject int `mapstructure:"recordsPerObject"`
 }

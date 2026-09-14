@@ -38,7 +38,7 @@ eventStream:
   # Leave empty in steady state so a lost checkpoint stops the collector
   # instead of silently skipping data.
   initialReplay: ""
-  appetite: 200                          # events requested per fetch
+  appetite: 100                          # events requested per fetch (Salesforce maximum is 100)
   leaseTtlSeconds: 30
   batch:
     maxEvents: 2000                      # flush when this many events are buffered
