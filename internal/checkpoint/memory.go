@@ -120,6 +120,10 @@ func (l *memoryLease) Commit(ctx context.Context, replayId []byte) error {
 			return err
 		}
 	}
+	// Behave like a network store: a cancelled context fails the call.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b := l.store.backend
 	b.mu.Lock()
 	if !l.holds() {
