@@ -50,8 +50,8 @@ type RedisConfig struct {
 	DbNumber uint   `mapstructure:"dbNumber"`
 	Username string `mapstructure:"username"`
 	Password string `mapstructure:"password"`
-	// Expiry for tokens and de-duplication markers only. Watermarks and
-	// stream replay checkpoints never expire.
+	// Expiry for tokens and de-duplication markers only (default 7 days).
+	// Watermarks and stream replay checkpoints never expire.
 	ExpireDays uint `mapstructure:"expireDays"`
 	// "standalone" (default, also ElastiCache cluster-mode-disabled) or "cluster".
 	Mode                string             `mapstructure:"mode"`
