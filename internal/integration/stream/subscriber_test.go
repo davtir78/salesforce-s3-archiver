@@ -679,3 +679,31 @@ func TestShutdownFlushIsBoundedByBudget(t *testing.T) {
 		t.Errorf("checkpoint must not advance when the flush was abandoned")
 	}
 }
+
+// A shutdown that lands during a keepalive checkpoint commit is a clean stop,
+// not a fatal error (seen as a CI flake under -race).
+func TestShutdownDuringKeepaliveCommitIsClean(t *testing.T) {
+	h := newHarness(t, mocksf.Options{KeepaliveInterval: 50 * time.Millisecond})
+	h.publish(5)
+	opts := h.options()
+	opts.InitialReplay = ReplayLatest
+
+	client, closeFn := h.client()
+	defer closeFn()
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	h.store.CommitHook = func([]byte) error {
+		once.Do(cancel) // SIGTERM arrives while the keepalive commit is in flight
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- NewSubscriber(opts, client, h.sink, h.store).Run(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown during a keepalive commit must be clean, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("subscriber did not stop")
+	}
+}
