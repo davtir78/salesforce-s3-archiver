@@ -21,8 +21,9 @@ eventStream:
   pubsubInsecure: true
   # Bootstraps an empty checkpoint store from the start of the retention window.
   initialReplay: EARLIEST
-  appetite: 200
+  appetite: 100
   leaseTtlSeconds: 15
+  shutdownFlushTimeoutSeconds: 90
   batch:
     maxEvents: 1000
     maxAgeSeconds: 5

@@ -121,6 +121,9 @@ type EventStreamConfig struct {
 	Batch         BatchConfig `mapstructure:"batch"`
 	// Lease TTL guarding each topic's checkpoint against concurrent writers.
 	LeaseTTLSeconds int `mapstructure:"leaseTtlSeconds"`
+	// Seconds a flush may take after SIGTERM before it is abandoned (default 90).
+	// Must be shorter than the orchestrator's stop timeout.
+	ShutdownFlushTimeoutSeconds int `mapstructure:"shutdownFlushTimeoutSeconds"`
 }
 
 type FieldNames = []string

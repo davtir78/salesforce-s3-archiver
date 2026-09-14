@@ -653,3 +653,29 @@ func TestReadinessWaitsForEveryLease(t *testing.T) {
 		t.Errorf("must not be ready after shutdown")
 	}
 }
+
+// A final flush that cannot finish must be abandoned within the shutdown
+// budget, so the process exits before the orchestrator's SIGKILL.
+func TestShutdownFlushIsBoundedByBudget(t *testing.T) {
+	h := newHarness(t, mocksf.Options{})
+	opts := h.options()
+	opts.MaxEvents = 10000
+	opts.MaxAge = time.Hour
+	opts.ShutdownFlushTimeout = 300 * time.Millisecond
+	_, stop := h.run(opts, h.store)
+	h.publish(20)
+	time.Sleep(500 * time.Millisecond)
+	h.sink.StoreDelay = 30 * time.Second // S3 is hanging
+
+	start := time.Now()
+	err := stop()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("shutdown took %s, exceeding the flush budget", elapsed)
+	}
+	if err == nil {
+		t.Errorf("an abandoned final flush must be reported as an error")
+	}
+	if _, ok := h.store.Checkpoint(h.key); ok {
+		t.Errorf("checkpoint must not advance when the flush was abandoned")
+	}
+}

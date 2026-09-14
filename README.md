@@ -108,8 +108,11 @@ SSE-KMS, ElastiCache for Valkey (Multi-AZ, TLS, IAM and password RBAC users) and
 ```bash
 bash scripts/aws-deploy.sh      # build, push and apply
 bash scripts/chaos-aws.sh       # chaos test with reconciliation
-bash scripts/aws-destroy.sh     # tear down
+CONFIRM_DESTROY=sfarchive-test bash scripts/aws-destroy.sh   # tear down (add FORCE_DESTROY_BUCKET=true to delete archived data)
 ```
+
+Terraform state is local by default and contains generated secrets; see
+[deploy/aws/backend.tf.example](deploy/aws/backend.tf.example) for remote state.
 
 To point it at a real org set `use_mock_salesforce=false` and the `salesforce_*` variables.
 

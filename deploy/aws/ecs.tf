@@ -1,6 +1,6 @@
 resource "aws_ecr_repository" "this" {
   name                 = var.name
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "IMMUTABLE"
   force_delete         = true
   image_scanning_configuration {
     scan_on_push = true
@@ -78,8 +78,9 @@ locals {
             region: ${var.region}
     ${local.pubsub_config}
       initialReplay: EARLIEST
-      appetite: 200
+      appetite: 100
       leaseTtlSeconds: 30
+      shutdownFlushTimeoutSeconds: 90
       batch:
         maxEvents: 2000
         maxAgeSeconds: 10
@@ -181,7 +182,7 @@ resource "aws_ecs_task_definition" "stream" {
     essential        = true
     entryPoint       = ["/bin/sh", "-c"]
     command          = ["printf '%s' \"$CONFIG_YAML\" > /tmp/config.yml && exec sf-archive-stream -config /tmp/config.yml"]
-    stopTimeout      = 60
+    stopTimeout      = 120 # Fargate maximum; above shutdownFlushTimeoutSeconds (90)
     environment      = [{ name = "CONFIG_YAML", value = local.stream_config }]
     secrets          = [{ name = "SF_CLIENT_SECRET", valueFrom = aws_ssm_parameter.sf_client_secret.arn }]
     portMappings     = [{ containerPort = 9090 }]
@@ -207,7 +208,7 @@ resource "aws_ecs_task_definition" "eventlog" {
     essential   = true
     entryPoint  = ["/bin/sh", "-c"]
     command     = ["printf '%s' \"$CONFIG_YAML\" > /tmp/config.yml && exec sf-archive-eventlog -config /tmp/config.yml"]
-    stopTimeout = 60
+    stopTimeout = 120 # Fargate maximum; above shutdownFlushTimeoutSeconds (90)
     environment = [{ name = "CONFIG_YAML", value = local.eventlog_config }]
     secrets = [
       { name = "SF_CLIENT_SECRET", valueFrom = aws_ssm_parameter.sf_client_secret.arn },

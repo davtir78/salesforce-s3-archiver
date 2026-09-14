@@ -66,9 +66,9 @@ variable "cache_node_type" {
 }
 
 variable "force_destroy" {
-  description = "Allow terraform destroy to delete a non-empty bucket (test stacks only)."
+  description = "Allow terraform destroy to delete a non-empty archive bucket. Leave false for anything holding real data; scripts/aws-destroy.sh sets it only with FORCE_DESTROY_BUCKET=true."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "cache_snapshot_retention_days" {

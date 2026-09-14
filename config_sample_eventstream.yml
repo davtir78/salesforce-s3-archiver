@@ -40,6 +40,7 @@ eventStream:
   initialReplay: ""
   appetite: 100                          # events requested per fetch (Salesforce maximum is 100)
   leaseTtlSeconds: 30
+  shutdownFlushTimeoutSeconds: 90        # keep below the orchestrator stop timeout (ECS stopTimeout, compose stop_grace_period)
   batch:
     maxEvents: 2000                      # flush when this many events are buffered
     maxAgeSeconds: 30                    # ...or when the oldest buffered event is this old

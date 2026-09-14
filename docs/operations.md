@@ -6,8 +6,10 @@
   (ECS: `minimumHealthyPercent=0`, `maximumPercent=100`). The checkpoint lease makes an
   accidental second instance wait rather than race, but it still delays recovery.
 - After a hard crash the replacement waits up to `leaseTtlSeconds` for the old lease to expire.
-- Give containers a stop timeout long enough to flush a batch (60s is typical). On SIGTERM the
-  collector flushes buffered events and commits the checkpoint.
+- On SIGTERM the stream collector flushes buffered events and commits the checkpoint, allowing
+  `shutdownFlushTimeoutSeconds` (default 90) before giving up without advancing it. Set the
+  orchestrator stop timeout above that (ECS `stopTimeout` 120, compose `stop_grace_period: 120s`)
+  so the process is not killed mid-flush.
 - Redis/ElastiCache: `maxmemory-policy noeviction`, TLS, Multi-AZ. Checkpoints never expire.
 
 ## Metrics
