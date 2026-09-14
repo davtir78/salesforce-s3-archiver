@@ -45,11 +45,63 @@ type CacheConfig struct {
 }
 
 type RedisConfig struct {
-	Host       string `mapstructure:"host"`
-	Port       uint   `mapstructure:"port"`
-	DbNumber   uint   `mapstructure:"dbNumber"`
-	Password   string `mapstructure:"password"`
-	ExpireDays uint   `mapstructure:"expireDays"`
+	Host     string `mapstructure:"host"`
+	Port     uint   `mapstructure:"port"`
+	DbNumber uint   `mapstructure:"dbNumber"`
+	Username string `mapstructure:"username"`
+	Password string `mapstructure:"password"`
+	// Expiry for tokens and de-duplication markers only. Watermarks and
+	// stream replay checkpoints never expire.
+	ExpireDays uint `mapstructure:"expireDays"`
+	// "standalone" (default, also ElastiCache cluster-mode-disabled) or "cluster".
+	Mode                string             `mapstructure:"mode"`
+	TLS                 RedisTLSConfig     `mapstructure:"tls"`
+	IAMAuth             RedisIAMAuthConfig `mapstructure:"iamAuth"`
+	DialTimeoutSeconds  uint               `mapstructure:"dialTimeoutSeconds"`
+	ReadTimeoutSeconds  uint               `mapstructure:"readTimeoutSeconds"`
+	WriteTimeoutSeconds uint               `mapstructure:"writeTimeoutSeconds"`
+	MaxRetries          int                `mapstructure:"maxRetries"`
+	KeyPrefix           string             `mapstructure:"keyPrefix"`
+}
+
+type RedisTLSConfig struct {
+	Enabled            bool   `mapstructure:"enabled"`
+	InsecureSkipVerify bool   `mapstructure:"insecureSkipVerify"`
+	CAFile             string `mapstructure:"caFile"`
+	ServerName         string `mapstructure:"serverName"`
+}
+
+type RedisIAMAuthConfig struct {
+	Enabled    bool   `mapstructure:"enabled"`
+	CacheName  string `mapstructure:"cacheName"`
+	UserId     string `mapstructure:"userId"`
+	Region     string `mapstructure:"region"`
+	Serverless bool   `mapstructure:"serverless"`
+}
+
+type ArchiveConfig struct {
+	S3    *S3Config           `mapstructure:"s3"`
+	Local *LocalArchiveConfig `mapstructure:"local"`
+}
+
+type S3Config struct {
+	Bucket         string `mapstructure:"bucket"`
+	Prefix         string `mapstructure:"prefix"`
+	Region         string `mapstructure:"region"`
+	Endpoint       string `mapstructure:"endpoint"`
+	ForcePathStyle bool   `mapstructure:"forcePathStyle"`
+	KmsKeyId       string `mapstructure:"kmsKeyId"`
+	StorageClass   string `mapstructure:"storageClass"`
+	MaxAttempts    int    `mapstructure:"maxAttempts"`
+}
+
+type LocalArchiveConfig struct {
+	Dir string `mapstructure:"dir"`
+}
+
+type BatchConfig struct {
+	MaxEvents     int `mapstructure:"maxEvents"`
+	MaxAgeSeconds int `mapstructure:"maxAgeSeconds"`
 }
 
 type EventStreamConfig struct {
@@ -58,6 +110,16 @@ type EventStreamConfig struct {
 	Cache    *CacheConfig `mapstructure:"cache"`
 	Appetite int32        `mapstructure:"appetite"`
 	Topics   []string     `mapstructure:"topics"`
+	// Pub/Sub API endpoint, default api.pubsub.salesforce.com:7443.
+	PubSubEndpoint string `mapstructure:"pubsubEndpoint"`
+	// Disable TLS for the Pub/Sub connection (mock servers only).
+	PubSubInsecure bool `mapstructure:"pubsubInsecure"`
+	// Where to start when no checkpoint exists: "EARLIEST" or "LATEST".
+	// Empty (default) refuses to start without a checkpoint.
+	InitialReplay string      `mapstructure:"initialReplay"`
+	Batch         BatchConfig `mapstructure:"batch"`
+	// Lease TTL guarding each topic's checkpoint against concurrent writers.
+	LeaseTTLSeconds int `mapstructure:"leaseTtlSeconds"`
 }
 
 type FieldNames = []string
@@ -113,6 +175,13 @@ type EventLogConfig struct {
 	CustomQueryFiles    []string           `mapstructure:"customQueryFiles"`
 	CustomQueries       []QueryConfig      `mapstructure:"customQueries"`
 	Limits              LimitsConfig       `mapstructure:"limits"`
+	// Seconds between polls (default 300).
+	PollIntervalSeconds uint `mapstructure:"pollIntervalSeconds"`
+	// Minutes subtracted from watermarks on each poll so late-arriving
+	// records are not skipped (default 60). Duplicates are removed downstream.
+	WatermarkOverlapMinutes uint `mapstructure:"watermarkOverlapMinutes"`
+	// Records per archived object for custom queries (default 10000).
+	RecordsPerObject int `mapstructure:"recordsPerObject"`
 }
 
 type Config struct {
@@ -120,7 +189,12 @@ type Config struct {
 	IsTemplate  bool               `mapstructure:"isTemplate"`
 	EventStream *EventStreamConfig `mapstructure:"eventStream"`
 	EventLog    *EventLogConfig    `mapstructure:"eventLog"`
-	Format      string             `mapstructure:"format"`
+	Archive     ArchiveConfig      `mapstructure:"archive"`
+	// Organisation ID override; normally discovered from the userinfo endpoint.
+	OrgId string `mapstructure:"orgId"`
+	// Address for the /metrics and /healthz HTTP server, e.g. ":9090". Empty disables it.
+	MetricsAddr string `mapstructure:"metricsAddr"`
+	LogLevel    string `mapstructure:"logLevel"`
 }
 
 func envVarDecoder() mapstructure.DecodeHookFunc {
@@ -162,19 +236,39 @@ func scanEnvVars(dict map[string]any) {
 	}
 }
 
+// ReadConfigFile loads a YAML config file. Values of the form "$VAR" are
+// replaced with the environment variable VAR.
+func ReadConfigFile(path string) (Config, error) {
+	v := viper.New()
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		return Config{}, fmt.Errorf("reading config file '%s': %w", path, err)
+	}
+	return unmarshalConfig(v)
+}
+
+// ReadConfig decodes the config already loaded into the global viper instance.
 func ReadConfig() (Config, error) {
+	return unmarshalConfig(viper.GetViper())
+}
+
+func unmarshalConfig(v *viper.Viper) (Config, error) {
 	conf := Config{}
 	decoderConf := viper.DecodeHook(
 		mapstructure.ComposeDecodeHookFunc(
 			envVarDecoder(),
 		),
 	)
-	if err := viper.Unmarshal(&conf, decoderConf); err != nil {
+	if err := v.Unmarshal(&conf, decoderConf); err != nil {
 		return Config{}, err
 	}
 
 	if err := integrityCheck(&conf); err != nil {
-		log.Fatalf(err)
+		return Config{}, err
+	}
+
+	if conf.LogLevel != "" {
+		log.SetLevel(conf.LogLevel)
 	}
 
 	return conf, nil
@@ -197,14 +291,11 @@ func integrityCheck(conf *Config) error {
 	if err != nil {
 		return errors.New("Conf file, wrong version key format, minor must be a number")
 	}
-	if major != 2 {
-		return fmt.Errorf("Conf file major version is '%d', expected '2'", major)
+	if major != 3 {
+		return fmt.Errorf("Conf file major version is '%d', expected '3'", major)
 	}
 	if minor != 0 {
 		log.Warnf("Conf file minor version is '%d', expected '0'", minor)
 	}
-	if conf.Format != "logs" && conf.Format != "events" {
-		return fmt.Errorf("Conf format must be either 'logs' or 'events'")
-	}
-	return nil
+	return CheckArchive(&conf.Archive)
 }

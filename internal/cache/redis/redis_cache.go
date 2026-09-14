@@ -2,60 +2,58 @@ package redis
 
 import (
 	"context"
-	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-type RedisConfig struct {
-	Host       string
-	Port       int
-	DbNumber   int
-	Password   string
-	ExpireDays int
-}
-
+// RedisCache implements the best-effort cache used for access tokens,
+// watermarks and de-duplication markers. Stream replay checkpoints do NOT use
+// this type: they live in the checkpoint store, which never sets a TTL.
 type RedisCache struct {
 	Conf   RedisConfig
-	Client *redis.Client
+	Client redis.UniversalClient
 }
 
-// Implement Cache interface for Redis
-
 func (c *RedisCache) GetCacheVal(key string) (any, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), c.opTimeout())
+	defer cancel()
 	val, err := c.Client.Get(ctx, key).Result()
 	if err == redis.Nil {
 		return nil, nil
-	} else {
-		return val, err
 	}
+	return val, err
 }
 
 func (c *RedisCache) SetCacheVal(key string, val any) error {
-	ctx := context.Background()
-	err := c.Client.Set(ctx, key, val, time.Duration(c.Conf.ExpireDays*24)*time.Hour).Err()
-	return err
+	return c.set(key, val, time.Duration(c.Conf.ExpireDays*24)*time.Hour)
+}
+
+// SetPersistentVal stores a value without expiry (used for watermarks).
+func (c *RedisCache) SetPersistentVal(key string, val any) error {
+	return c.set(key, val, 0)
+}
+
+func (c *RedisCache) set(key string, val any, ttl time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.opTimeout())
+	defer cancel()
+	return c.Client.Set(ctx, key, val, ttl).Err()
 }
 
 func (c *RedisCache) DelCacheVal(key string) error {
-	ctx := context.Background()
-	err := c.Client.Del(ctx, key).Err()
-	return err
+	ctx, cancel := context.WithTimeout(context.Background(), c.opTimeout())
+	defer cancel()
+	return c.Client.Del(ctx, key).Err()
 }
 
-// Create new Redis cache object
+func (c *RedisCache) opTimeout() time.Duration {
+	return c.Conf.ReadTimeout + c.Conf.WriteTimeout + 2*time.Second
+}
 
-func NewRedisCache(conf RedisConfig) RedisCache {
-	client := redis.NewClient(&redis.Options{
-		Addr:     conf.Host + ":" + strconv.Itoa(conf.Port),
-		Password: conf.Password,
-		DB:       conf.DbNumber,
-	})
-	//TODO: how to set SSL?
-	return RedisCache{
-		Conf:   conf,
-		Client: client,
+func NewRedisCache(conf RedisConfig) (RedisCache, error) {
+	client, err := NewClient(conf)
+	if err != nil {
+		return RedisCache{}, err
 	}
+	return RedisCache{Conf: conf.WithDefaults(), Client: client}, nil
 }
