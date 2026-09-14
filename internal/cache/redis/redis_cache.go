@@ -25,8 +25,16 @@ func (c *RedisCache) GetCacheVal(key string) (any, error) {
 	return val, err
 }
 
+// DefaultExpireDays applies to tokens and de-duplication markers when expireDays
+// is not set, so they cannot accumulate forever.
+const DefaultExpireDays = 7
+
 func (c *RedisCache) SetCacheVal(key string, val any) error {
-	return c.set(key, val, time.Duration(c.Conf.ExpireDays*24)*time.Hour)
+	days := c.Conf.ExpireDays
+	if days <= 0 {
+		days = DefaultExpireDays
+	}
+	return c.set(key, val, time.Duration(days*24)*time.Hour)
 }
 
 // SetPersistentVal stores a value without expiry (used for watermarks).

@@ -1,79 +1,52 @@
-# ATTENTION: THIS IS NOT A WORKING CONFIG FILE, BUT A TEMPLATE YOU CAN USE TO BUILD YOUR OWN.
-
-version: "2.0"
-isTemplate: true  # Remove or set it to "false" after setting up all the options below
-
-### Config for the Event Log integration
+# Sample configuration for sf-archive-eventlog. Values like $VAR are read from the environment.
+version: "3.0"
+logLevel: info
+metricsAddr: ":9090"
 
 eventLog:
-  instanceName: "myorg-staging-1" # SET A MEANINGFUL AND UNIQUE INSTANCE NAME
-  requestTimeout: 10 # EDIT TIMEOUT HERE
-  apiVer: "64.0" # EDIT INSTANCE SPECIFIC API VERSION HERE, OR REMOVE
+  instanceName: myorg-prod
+  apiVer: "64.0"
+  requestTimeout: 30                     # seconds, API calls (downloads are not limited)
+  pollIntervalSeconds: 300
+  watermarkOverlapMinutes: 60            # re-read window for late-arriving records
   auth:
-    tokenUrl: "<TOKEN URL HERE>"
-    # EDIT, LEAVE ONLY ONE AUTH METHOD
-    jwt:
-      clientId: "<CLIENT ID HERE>"
-      privateKey: "<PRIVATE KEY FILE PATH HERE>"
-      username: "<USER NAME HERE>"
+    tokenUrl: https://example.my.salesforce.com
     clientCred:
-      clientId: "<CLIENT ID HERE>"
-      clientSecret: "<CLIENT SECRET HERE>"
-    userPass: # WARNING: DO NOT USE. CHECKOUT THE REPO README FOR MORE INFO.
-      clientId: "<CLIENT ID HERE>"
-      clientSecret: "<CLIENT SECRET HERE>"
-      username: "<USER NAME HERE>"
-      password: "<PASSWORD HERE>"
+      clientId: $SF_CLIENT_ID
+      clientSecret: $SF_CLIENT_SECRET
   cache:
-    redis:
-      host: "<REDIS SERVER HOST HERE>"
-      port: 6379 # EDIT REDIS SERVER PORT HERE
-      dbNumber: 0 # EDIT REDIS SERVER DATABASE NUMBER HERE
-      password: "<PASSWORD HERE or empty if no password>"
-      expireDays: 1 # EDIT KEY EXPIRATION TIME HERE
-  initialTimeInterval: # EDIT INITIAL TIME INTERVAL HERE
-    hours: 6
-    minutes: 30
-  eventTypes: # EDIT EVENT TYPES HERE
+    redis:                               # recommended; without it watermarks reset on restart
+      host: master.my-cache.xxxxxx.apse2.cache.amazonaws.com
+      port: 6379
+      username: archiver
+      password: $REDIS_PASSWORD
+      expireDays: 7                      # de-duplication markers only
+      tls:
+        enabled: true
+  initialTimeInterval:                   # how far back to start when no watermark exists
+    hours: 24
+  # noInterval: true                     # include Daily EventLogFiles (default: Hourly only)
+  eventTypes:                            # empty = all event types
     - Login
-    - URI
     - API
-    - ApexCallout
-  fieldMappingFile: event_type_fields.yml # EDIT FIELD MAPPING FILE HERE, OR REMOVE
-  fieldMapping: # EDIT FIELD MAPPING HERE, OR REMOVE
-    Login: ["RUN_TIME", "LOGIN_TYPE", "API_TYPE"]
-    URI: ["URI", "CLIENT_IP", "USER_ID"]
-  customQueries: # EDIT CUSTOM QUERIES HERE, OR REMOVE
+    - URI
+    - Report
+  # fieldMapping:                        # optional: keep only these columns per event type
+  #   Login: [USER_ID, CLIENT_IP, LOGIN_STATUS]
+  customQueries:
     - soql:
-        select: [Action, CreatedDate]
-        from: "SetupAuditTrail"
-        where: "Action = 'changedApexClass'"
-      apiVer: "64.0"  # EDIT QUERY SPECIFIC API VERSION HERE, OR REMOVE
+        select: [Id, Action, Section, Display, CreatedDate, CreatedById]
+        from: SetupAuditTrail
       timestamp: CreatedDate
-      apiName: rest # either "rest" or "tooling"
-  customQueryFiles: # EDIT CUSTOM QUERIES FILES HERE, OR REMOVE
-    - "/path/to/query_one.yml"
-    - "/path/to/query_two.yml"
-  limits: # EDIT API LIMITS HERE, OR REMOVE
-    apiVer: "58.0" # EDIT LIMITS API VERSION HERE, OR REMOVE
-    names:
-      - ActiveScratchOrgs
-      - DailyApiRequests
-      - PublishCallbackUsageInApex
-      - PermissionSets
+      apiName: rest                      # rest or tooling
+  recordsPerObject: 10000
+  limits:
+    names: [DailyApiRequests, DailyStreamingApiEvents, HourlyPublishedStandardVolumePlatformEvents]
+  # skipLimits: true
+  # skipLogFiles: true
 
-### Config for the New Relic client
-
-licenseKey: "<LICENSE KEY HERE>"
-accountId: "<ACCOUNT ID HERE>"
-region: "<REGION HERE>" # One of: "EU" "US" "JP" "GOV"
-format: "<FORMAT HERE>" # either "events" or "logs"
-
-### Config for the integration lifecycle
-
-runAsService: false # EDIT RUN MODE HERE, OR REMOVE
-
-pipeline:
-  harvestInterval: 120 # EDIT HARVEST INTERVAL HERE, OR REMOVE
-
-interval: 30 # EDIT EXECUTION INTERVAL HERE, OR REMOVE
+archive:
+  s3:
+    bucket: my-salesforce-archive
+    prefix: salesforce
+    region: ap-southeast-2

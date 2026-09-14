@@ -256,7 +256,7 @@ func (c *PubSubClient) Subscribe(subsOpts SubscribeOpts, db cache.Cache, instanc
 
 	// Store the Replay ID in the cache
 	curReplayId := subsOpts.ReplayId
-	err = subsOpts.Cache.SetCacheVal(subsOpts.ReplayIdKey, string(curReplayId))
+	err = cache.SetPersistent(subsOpts.Cache, subsOpts.ReplayIdKey, string(curReplayId))
 	if err != nil {
 		log.Debugf("Error updating ReplayId = %s", err)
 	}
@@ -306,7 +306,7 @@ func (c *PubSubClient) Subscribe(subsOpts SubscribeOpts, db cache.Cache, instanc
 
 			// Store the Replay ID in the cache
 			curReplayId = event.GetReplayId()
-			err = subsOpts.Cache.SetCacheVal(subsOpts.ReplayIdKey, string(curReplayId))
+			err = cache.SetPersistent(subsOpts.Cache, subsOpts.ReplayIdKey, string(curReplayId))
 			if err != nil {
 				log.Debugf("Error updating ReplayId = %s", err)
 			}

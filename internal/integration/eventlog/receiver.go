@@ -391,7 +391,8 @@ func getLastRunFromCache(s SalesforceReceiverInterface, cacheKey string) time.Ti
 
 func setLastRunIntoCache(s SalesforceReceiverInterface, ts time.Time, cacheKey string) {
 	tsStr := strconv.FormatInt(ts.UnixMilli(), 10)
-	err := s.getDB().SetCacheVal(cacheKey, tsStr)
+	// Watermarks must not expire: a lost watermark silently resets the window.
+	err := cache.SetPersistent(s.getDB(), cacheKey, tsStr)
 	if err != nil {
 		log.Errorf("Error setting 'last_run_ts' into cache: %s", err.Error())
 	}
