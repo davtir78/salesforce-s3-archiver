@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6379:6379"]
+      minio:
+        image: quay.io/minio/minio:latest
+        ports: ["9000:9000"]
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: --entrypoint "minio server /data"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: vet
+        run: go vet ./...
+      - name: create bucket
+        run: |
+          for i in $(seq 1 30); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin aws --endpoint-url http://localhost:9000 --region us-east-1 s3 mb s3://archive
+      - name: test (race)
+        env:
+          LOG_LEVEL: error
+          REDIS_TEST_HOST: localhost
+          REDIS_TEST_PORT: "6379"
+          S3_TEST_ENDPOINT: http://localhost:9000
+          S3_TEST_BUCKET: archive
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        run: go test -race -count=1 ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --build-arg VERSION=${GITHUB_SHA::7} -t salesforce-s3-archiver:ci .
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=deploy/aws fmt -check -recursive
+      - run: terraform -chdir=deploy/aws init -backend=false && terraform -chdir=deploy/aws validate

@@ -1,108 +1,163 @@
-[![Community Project header](https://github.com/newrelic/open-source-office/raw/master/examples/categories/images/Community_Project.png)](https://github.com/newrelic/open-source-office/blob/master/examples/categories/index.md#category-community-project)
+# salesforce-s3-archiver
 
-![GitHub forks](https://img.shields.io/github/forks/newrelic/newrelic-salesforce-exporter?style=social)
-![GitHub stars](https://img.shields.io/github/stars/newrelic/newrelic-salesforce-exporter?style=social)
-![GitHub watchers](https://img.shields.io/github/watchers/newrelic/newrelic-salesforce-exporter?style=social)
+Archives Salesforce Event Monitoring data to Amazon S3 without silent data loss.
 
-![GitHub all releases](https://img.shields.io/github/downloads/newrelic/newrelic-salesforce-exporter/total)
-![GitHub release (latest by date)](https://img.shields.io/github/v/release/newrelic/newrelic-salesforce-exporter)
-![GitHub last commit](https://img.shields.io/github/last-commit/newrelic/newrelic-salesforce-exporter)
-![GitHub Release Date](https://img.shields.io/github/release-date/newrelic/newrelic-salesforce-exporter)
+It collects:
 
-![GitHub issues](https://img.shields.io/github/issues/newrelic/newrelic-salesforce-exporter)
-![GitHub issues closed](https://img.shields.io/github/issues-closed/newrelic/newrelic-salesforce-exporter)
-![GitHub pull requests](https://img.shields.io/github/issues-pr/newrelic/newrelic-salesforce-exporter)
-![GitHub pull requests closed](https://img.shields.io/github/issues-pr-closed/newrelic/newrelic-salesforce-exporter)
+- **Real-Time Event Monitoring streams** via the Salesforce Pub/Sub API (`sf-archive-stream`)
+- **EventLogFiles**, **custom SOQL query results** and **org limits** via the REST API (`sf-archive-eventlog`)
 
-# Salesforce Exporter for New Relic
+and writes them to S3 as gzip-compressed NDJSON with a manifest per object.
 
-> [!IMPORTANT]
-> If you are still using the legacy (`v2`) integration written in Python and you're looking to
-> upgrade to the latest version (`v3`), check out our [migration guide](./MIGRATION.md).
+This project is a hard fork of the Apache-2.0 licensed
+[newrelic/newrelic-salesforce-exporter](https://github.com/newrelic/newrelic-salesforce-exporter).
+The Salesforce collection code is derived from that project; the New Relic export path was
+replaced with an S3 archive and a number of data-loss bugs were fixed (see [below](#changes-from-upstream)).
+It is not affiliated with or endorsed by New Relic or Salesforce.
 
-The Salesforce Exporter is composed of two different integrations:
+## Guarantees
 
-- [Event Logs integration](cmd/nr-salesforce-eventlog/)
-- [Event Stream integration](cmd/nr-salesforce-stream/)
+| Source | Delivery | How |
+|---|---|---|
+| Pub/Sub streams | At-least-once | The replay checkpoint only advances after events are durably written to S3. Restarts may re-archive a batch; they never skip one. |
+| EventLogFiles | Idempotent | One object per file at a deterministic key (`elf-<Id>`). The watermark only moves past archived files. |
+| Custom SOQL queries | At-least-once | Watermark advances only after every object is written; overlapping windows are de-duplicated on `Id` + timestamp. |
 
-Please refer to the corresponding readme file for further details.
+Downstream consumers should de-duplicate on `EventIdentifier` (streams), `REQUEST_ID`/file Id (EventLogFiles) or `Id` + timestamp (SOQL).
 
-We also offer an [Installer Tool](cmd/installer-tool/) to simplify the installation and setup process.
+The stream collector **fails closed**: it refuses to start without a checkpoint unless
+`initialReplay` is set, stops if Salesforce rejects its stored replay ID (for example it is
+older than the retention window), and stops if its checkpoint lease is lost. Silently falling
+back to `LATEST` would hide data loss.
 
-### Docker
+## Quick start (Docker, no Salesforce org needed)
 
-To build the [docker image](./docker/Dockerfile) provided in this repo, run the
-following command:
+The repository includes a mock Salesforce org (OAuth, REST, Pub/Sub gRPC) so everything can be
+run and tested locally.
 
 ```bash
-docker buildx build -f ./docker/Dockerfile \
---tag newrelic/newrelic-salesforce-exporter:3.X.Y \
---tag newrelic/newrelic-salesforce-exporter:v3 \
---tag newrelic/newrelic-salesforce-exporter:latest \
---platform linux/amd64,linux/arm64 .
+sh scripts/dev-certs.sh                                   # TLS certs for local Valkey
+docker compose -f deploy/local/docker-compose.yml up -d --build
+curl -XPOST localhost:18080/admin/generator -d '{"eventsPerSecond":50,"eventLogFileEverySeconds":30}'
 ```
 
-Setting the appropriate values for `X` and `Y` depending on the version.
+- MinIO console: http://localhost:19001 (`minioadmin` / `minioadmin`), bucket `archive`
+- Metrics: http://localhost:19091/metrics (stream), http://localhost:19092/metrics (event log)
 
-This will build the same image published in [DockerHub](https://hub.docker.com/r/newrelic/newrelic-salesforce-exporter).
+Run the chaos test (kills collectors, restarts Valkey, pauses S3, injects Salesforce faults,
+then reconciles every generated record against the archive):
 
-### Support
+```bash
+DURATION=300 bash scripts/chaos-local.sh
+```
 
-New Relic has open-sourced this project. This project is provided AS-IS WITHOUT
-WARRANTY OR DEDICATED SUPPORT. Issues and contributions should be reported to
-the project here on GitHub.
+## Configuration
 
-We encourage you to bring your experiences and questions to the
-[Explorers Hub](https://discuss.newrelic.com/) where our community members
-collaborate on solutions and new ideas.
+See [config_sample_eventstream.yml](config_sample_eventstream.yml) and
+[config_sample_eventlog.yml](config_sample_eventlog.yml). Values of the form `$VAR` are read
+from environment variables.
 
-### Upgrading
+```bash
+sf-archive-stream   -config stream.yml
+sf-archive-eventlog -config eventlog.yml          # add -once for scheduled tasks / CronJobs
+```
 
-New Relic recommends that you update the Salesforce Exporter regularly and at a
-minimum every 3 months.
+### Redis / ElastiCache
 
-### Privacy
+Redis (or Valkey) stores replay checkpoints, watermarks, tokens and de-duplication markers.
+It is **required** for the stream collector.
 
-At New Relic we take your privacy and the security of your information
-seriously, and are committed to protecting your information. We must emphasize
-the importance of not sharing personal data in public forums, and ask all users
-to scrub logs and diagnostic information for sensitive information, whether
-personal, proprietary, or otherwise.
+- TLS (`tls.enabled`, optional `caFile`, `serverName`)
+- Password / AUTH token, or RBAC `username` + `password`
+- **ElastiCache IAM authentication** (`iamAuth`), for replication groups and serverless caches
+- Cluster mode (`mode: cluster`)
+- Timeouts and retries
 
-We define “Personal Data” as any information relating to an identified or
-identifiable individual, including, for example, your name, phone number, post
-code or zip code, Device ID, IP address, and email address.
+Checkpoints and watermarks are written without a TTL; `expireDays` only applies to tokens and
+de-duplication markers. Configure the server with `maxmemory-policy noeviction`.
 
-For more information, review [New Relic’s General Data Privacy Notice](https://newrelic.com/termsandconditions/privacy).
+Each topic's checkpoint is protected by a lease: if two collectors for the same topic run at
+once (for example during a node partition) the second waits, and a collector that loses its
+lease stops before it can move the checkpoint.
 
-### Contribute
+### S3 layout
 
-We encourage your contributions to improve this project! Keep in mind that
-when you submit your pull request, you'll need to sign the CLA via the
-click-through using CLA-Assistant. You only have to sign the CLA one time per
-project.
+```text
+<prefix>/raw/source=<stream|eventlog|soql|limits>/org_id=<org>/event_type=<type>/year=YYYY/month=MM/day=DD/hour=HH/<name>.json.gz
+<prefix>/manifests/<same partition path>/<name>.manifest.json
+```
 
-If you have any questions, or to execute our corporate CLA (which is required
-if your contribution is on behalf of a company), drop us an email at
-opensource@newrelic.com.
+Stream and SOQL objects are partitioned by ingestion time and use unique names; EventLogFiles
+are partitioned by `LogDate` and named `elf-<Id>`. Each NDJSON line contains `eventType`,
+`timestamp`, `source`, `orgId`, `instance`, `replayId` (streams) and the original `attributes`.
+Manifests record the record count, sizes, SHA-256, first/last timestamp and lineage (topic and
+replay ID range, or EventLogFile Id).
 
-**A note about vulnerabilities**
+Manifests live under a separate prefix so Athena/Glue tables over `raw/` only see data.
 
-As noted in our [security policy](../../security/policy), New Relic is committed
-to the privacy and security of our customers and their data. We believe that
-providing coordinated disclosure by security researchers and engaging with the
-security community are important means to achieve our security goals.
+## Operations
 
-If you believe you have found a security vulnerability in this project or any of
-New Relic's products or websites, we welcome and greatly appreciate you
-reporting it to New Relic through [HackerOne](https://hackerone.com/newrelic).
+See [docs/operations.md](docs/operations.md) for metrics, alerts and recovery procedures,
+including resetting a checkpoint after Salesforce rejects a replay ID.
 
-If you would like to contribute to this project, review [these guidelines](./CONTRIBUTING.md).
+## Deploying to AWS (optional)
 
-To all contributors, we thank you!  Without your contribution, this project
-would not be what it is today.
+[deploy/aws](deploy/aws) contains a Terraform test stack: ECS Fargate services, S3 with
+SSE-KMS, ElastiCache for Valkey (Multi-AZ, TLS, IAM and password RBAC users) and the mock org.
 
-### License
+```bash
+bash scripts/aws-deploy.sh      # build, push and apply
+bash scripts/chaos-aws.sh       # chaos test with reconciliation
+bash scripts/aws-destroy.sh     # tear down
+```
 
-The [New Relic Salesforce Exporter] project is licensed under the
-[Apache 2.0](http://apache.org/licenses/LICENSE-2.0.txt) License.
+To point it at a real org set `use_mock_salesforce=false` and the `salesforce_*` variables.
+
+## Development
+
+```bash
+go test ./...                                  # unit, mock-org, crash-matrix and chaos tests
+go test -race ./...                            # requires cgo (or run in a golang container)
+S3_TEST_ENDPOINT=http://localhost:9000 S3_TEST_BUCKET=archive go test ./internal/archive
+REDIS_TEST_HOST=localhost REDIS_TEST_PORT=6379 go test ./internal/checkpoint
+```
+
+| Path | Purpose |
+|---|---|
+| `cmd/sf-archive-stream` | Pub/Sub stream collector |
+| `cmd/sf-archive-eventlog` | EventLogFile, SOQL and limits collector |
+| `cmd/sf-archive-verify` | Reconciles an S3 archive against manifests and the mock ledger |
+| `cmd/mock-salesforce` | Mock Salesforce org for local and CI testing |
+| `internal/archive` | S3, local and in-memory archive sinks |
+| `internal/checkpoint` | Leased replay checkpoint store |
+| `internal/integration/stream` | Subscriber (archive, then checkpoint) |
+| `internal/integration/eventlog` | EventLogFile / SOQL collector |
+| `internal/mocksf` | Mock org implementation |
+
+The mock is modelled on public Salesforce documentation. Validate authentication, Pub/Sub
+error codes and limits against a real org (a free Developer Edition org is sufficient) before
+production use.
+
+## Changes from upstream
+
+Stream collector:
+
+- The replay ID was persisted as each event arrived, before it was exported: a crash lost events.
+- Export errors were logged at debug level and the batch discarded.
+- Checkpoint keys expired after `expireDays`; a missing checkpoint silently fell back to `LATEST`.
+- Non-union Avro fields other than `CreatedDate`/`CreatedById` were dropped.
+- Redis TLS was not supported.
+
+Event log collector:
+
+- Downloaded CSV files were never closed (file descriptor leak).
+- The watermark jumped to the newest listed file even when downloads or exports failed, and
+  results were not ordered.
+- Pagination (`nextRecordsUrl`) was ignored, so rows after the first page were dropped.
+- Custom query watermarks advanced when queries failed; query upper bounds had sub-second
+  precision that could skip boundary records.
+- Strings were truncated to 4096 characters and numeric-looking values converted.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

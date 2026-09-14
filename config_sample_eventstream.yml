@@ -1,60 +1,69 @@
-# ATTENTION: THIS IS NOT A WORKING CONFIG FILE, BUT A TEMPLATE YOU CAN USE TO BUILD YOUR OWN.
-
-version: "2.0"
-isTemplate: true  # Remove or set it to "false" after setting up all the options below
-
-### Config for the Event Streamming integration
+# Sample configuration for sf-archive-stream. Values like $VAR are read from the environment.
+version: "3.0"
+logLevel: info
+metricsAddr: ":9090"
+# orgId: 00D...   # optional override; discovered from the userinfo endpoint
 
 eventStream:
-  instanceName: "myorg-staging-1" # SET A MEANINGFUL AND UNIQUE INSTANCE NAME
+  instanceName: myorg-prod               # unique per org; part of checkpoint keys
   auth:
-    tokenUrl: "<TOKEN URL HERE>"
-    # EDIT, LEAVE ONLY ONE AUTH METHOD
-    jwt:
-      clientId: "<CLIENT ID HERE>"
-      privateKey: "<PRIVATE KEY FILE PATH HERE>"
-      username: "<USER NAME HERE>"
+    tokenUrl: https://example.my.salesforce.com
+    # Exactly one auth method. Client credentials or JWT are recommended.
     clientCred:
-      clientId: "<CLIENT ID HERE>"
-      clientSecret: "<CLIENT SECRET HERE>"
-    userPass: # WARNING: DO NOT USE. CHECKOUT THE REPO README FOR MORE INFO.
-      clientId: "<CLIENT ID HERE>"
-      clientSecret: "<CLIENT SECRET HERE>"
-      username: "<USER NAME HERE>"
-      password: "<PASSWORD HERE>"
+      clientId: $SF_CLIENT_ID
+      clientSecret: $SF_CLIENT_SECRET
+    # jwt:
+    #   clientId: $SF_CLIENT_ID
+    #   privateKey: /secrets/salesforce.key
+    #   username: integration@example.com
   cache:
-    redis:
-      host: "<REDIS SERVER HOST HERE>"
-      port: 6379 # EDIT REDIS SERVER PORT HERE
-      dbNumber: 0 # EDIT REDIS SERVER DATABASE NUMBER HERE
-      password: "<PASSWORD HERE or empty if no password>"
-      expireDays: 1 # EDIT KEY EXPIRATION TIME HERE
-  appetite: 50 # EDIT APPETITE HERE (maximum number of events to read per call)
-  topics: # EDIT TOPICS HERE (events to capture)
-    - /event/ApiEventStream
-    - /event/ApiAnomalyEvent
-    - /event/BatchApexErrorEvent
-    - /event/BulkApiResultEvent
-    - /event/ConcurLongRunApexErrEvent
-    - /event/CredentialStuffingEvent
-    - /event/FileEvent
-    - /event/GuestUserAnomalyEvent
-    - /event/LightningUriEventStream
-    - /event/ListViewEventStream
+    redis:                               # required for the stream collector
+      host: master.my-cache.xxxxxx.apse2.cache.amazonaws.com
+      port: 6379
+      tls:
+        enabled: true
+      # Password / AUTH token or RBAC user:
+      username: archiver
+      password: $REDIS_PASSWORD
+      # Or ElastiCache IAM authentication (no password):
+      # iamAuth:
+      #   enabled: true
+      #   cacheName: my-cache            # replication group ID or serverless cache name
+      #   userId: archiver-iam           # must equal the ElastiCache user name
+      #   region: ap-southeast-2
+      #   serverless: false
+      # mode: cluster                    # for cluster-mode-enabled caches
+      # keyPrefix: "prod:"
+  # Where to start when a topic has no checkpoint: EARLIEST or LATEST.
+  # Leave empty in steady state so a lost checkpoint stops the collector
+  # instead of silently skipping data.
+  initialReplay: ""
+  appetite: 200                          # events requested per fetch
+  leaseTtlSeconds: 30
+  batch:
+    maxEvents: 2000                      # flush when this many events are buffered
+    maxAgeSeconds: 30                    # ...or when the oldest buffered event is this old
+  topics:
     - /event/LoginEventStream
-    - /event/LoginAnomalyEvent
-    - /event/LoginAsEventStream
-    - /event/LogoutEventStream
-    - /event/PermissionSetEvent
-    - /event/PlatformStatusAlertEvent
-    - /event/ReportEventStream
-    - /event/ReportAnomalyEvent
-    - /event/SessionHijackingEvent
+    - /event/ApiEventStream
+    - /event/LightningUriEventStream
     - /event/UriEventStream
+    - /event/ReportEventStream
+    - /event/ListViewEventStream
+    - /event/LogoutEventStream
+    - /event/LoginAsEventStream
+    - /event/SessionHijackingEvent
+    - /event/CredentialStuffingEvent
+    - /event/ReportAnomalyEvent
+    - /event/ApiAnomalyEvent
+    - /event/PermissionSetEvent
+    - /event/FileEvent
 
-### Config for the New Relic client
-
-licenseKey: "<LICENSE KEY HERE>"
-accountId: "<ACCOUNT ID HERE>"
-region: "<REGION HERE>" # One of: "EU" "US" "JP" "GOV"
-format: "<FORMAT HERE>" # either "events" or "logs"
+archive:
+  s3:
+    bucket: my-salesforce-archive
+    prefix: salesforce
+    region: ap-southeast-2
+    # kmsKeyId: arn:aws:kms:...          # optional; bucket default encryption also applies
+    # uploadTimeoutSeconds: 300
+    # maxAttempts: 5
