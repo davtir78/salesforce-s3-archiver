@@ -12,7 +12,7 @@ import (
 
 const (
 	defaultApiVer  = "55.0"
-	defaultTimeout = 5
+	defaultTimeout = 30
 	apiNameRest    = "rest"
 	apiNameTooling = "tooling"
 	defaultApiName = apiNameRest
