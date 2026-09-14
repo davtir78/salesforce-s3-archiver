@@ -1,7 +1,0 @@
-FROM newrelic/newrelic-salesforce-exporter
-
-WORKDIR /app
-
-COPY config.yml ./
-
-CMD ["./nr-salesforce-stream"]

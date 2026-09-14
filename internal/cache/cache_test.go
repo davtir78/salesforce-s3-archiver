@@ -3,8 +3,8 @@ package cache
 import (
 	"testing"
 
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/cache/redis"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/cache/redis"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
 )
 
 func TestBuildCache(t *testing.T) {

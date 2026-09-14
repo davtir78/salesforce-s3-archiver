@@ -4,7 +4,7 @@ import (
 	"errors"
 	"net/url"
 
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 )
 
 func CheckUrl(urlStr string) bool {

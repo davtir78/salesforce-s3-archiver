@@ -7,14 +7,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/cache"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream/pubsub/common"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream/pubsub/grpcclient"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream/pubsub/proto"
+	"github.com/davtir78/salesforce-s3-archiver/internal/cache"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/common"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/grpcclient"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/proto"
 
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 )
 
 var integrationConf config.Config

@@ -6,9 +6,9 @@ import (
 
 func rightConfig() Config {
 	return Config{
-		Version: "2.0",
+		Version:    "2.0",
 		IsTemplate: false,
-		Format: "events",
+		Format:     "events",
 	}
 }
 
@@ -20,7 +20,7 @@ func TestIntegrityCheck(t *testing.T) {
 	}
 
 	config = rightConfig()
-	
+
 	err = integrityCheck(&config)
 	if err != nil {
 		t.Errorf("Integrity check failed with a correct config")
@@ -49,7 +49,7 @@ func TestIntegrityCheck(t *testing.T) {
 	if err == nil {
 		t.Errorf("Integrity check didn't catch a wrong version value (3.0)")
 	}
-	
+
 	config = rightConfig()
 
 	config.Format = "hello"

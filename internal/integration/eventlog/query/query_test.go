@@ -6,7 +6,7 @@ func TestSoqlQuery(t *testing.T) {
 	soql := MakeSoqlQuery("MyTable", "one")
 	soqlStr := soql.Build()
 	expected := "SELECT+one+FROM+MyTable"
-		if soqlStr != expected {
+	if soqlStr != expected {
 		t.Errorf("First SOQL is not the expected: %s", soqlStr)
 	}
 

@@ -1,9 +1,9 @@
 package cache
 
 import (
-	labslog "github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/cache/redis"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/cache/redis"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 )
 
 type Cache interface {
@@ -12,7 +12,7 @@ type Cache interface {
 	DelCacheVal(key string) error
 }
 
-type DummyCache struct {}
+type DummyCache struct{}
 
 func (c *DummyCache) GetCacheVal(key string) (any, error) {
 	return nil, nil
@@ -30,21 +30,21 @@ func BuildCache(conf *config.CacheConfig) Cache {
 	var db Cache
 	if conf != nil {
 		if conf.Redis != nil {
-			labslog.Debugf("Using Redis cache")
+			log.Debugf("Using Redis cache")
 			redisDb := redis.NewRedisCache(redis.RedisConfig{
-				Host: conf.Redis.Host,
-				Port: int(conf.Redis.Port),
-				DbNumber: int(conf.Redis.DbNumber),
-				Password: conf.Redis.Password,
+				Host:       conf.Redis.Host,
+				Port:       int(conf.Redis.Port),
+				DbNumber:   int(conf.Redis.DbNumber),
+				Password:   conf.Redis.Password,
 				ExpireDays: int(conf.Redis.ExpireDays),
 			})
 			db = &redisDb
 		} else {
-			labslog.Warnf("No redis cache config")
+			log.Warnf("No redis cache config")
 			db = &DummyCache{}
 		}
 	} else {
-		labslog.Warnf("No cache config")
+		log.Warnf("No cache config")
 		db = &DummyCache{}
 	}
 

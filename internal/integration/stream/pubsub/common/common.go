@@ -3,7 +3,7 @@ package common
 import (
 	"time"
 
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
 )
 
 const (

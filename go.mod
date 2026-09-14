@@ -1,4 +1,4 @@
-module github.com/newrelic/newrelic-salesforce-exporter
+module github.com/davtir78/salesforce-s3-archiver
 
 go 1.25.3
 

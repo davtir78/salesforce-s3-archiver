@@ -10,8 +10,8 @@ import (
 
 	"regexp"
 
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 	"github.com/go-viper/mapstructure/v2"
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
 	"github.com/spf13/viper"
 )
 

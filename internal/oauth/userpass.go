@@ -8,8 +8,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 )
 
 func AuthWithUserPass(tokenUrl string, auth *config.UserPassAuth) (*AuthResponse, error) {
