@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -152,5 +154,32 @@ func TestFillErrorStoresNothing(t *testing.T) {
 	})
 	if err == nil || len(sink.Keys()) != 0 {
 		t.Errorf("expected error and no stored objects, got err=%v keys=%v", err, sink.Keys())
+	}
+}
+
+func TestS3UploadTimesOutOnHungConnection(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // never answers until the test ends
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	sink, err := NewS3Sink(context.Background(), S3Options{
+		Bucket: "b", Endpoint: srv.URL, ForcePathStyle: true, Region: "us-east-1",
+		MaxAttempts: 1, UploadTimeout: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = WriteRecords(context.Background(), sink, ObjectMeta{Source: SourceStream}, sampleRecords(3))
+	if err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("upload did not time out promptly: %s", elapsed)
 	}
 }

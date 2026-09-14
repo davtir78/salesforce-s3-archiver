@@ -85,14 +85,15 @@ type ArchiveConfig struct {
 }
 
 type S3Config struct {
-	Bucket         string `mapstructure:"bucket"`
-	Prefix         string `mapstructure:"prefix"`
-	Region         string `mapstructure:"region"`
-	Endpoint       string `mapstructure:"endpoint"`
-	ForcePathStyle bool   `mapstructure:"forcePathStyle"`
-	KmsKeyId       string `mapstructure:"kmsKeyId"`
-	StorageClass   string `mapstructure:"storageClass"`
-	MaxAttempts    int    `mapstructure:"maxAttempts"`
+	Bucket               string `mapstructure:"bucket"`
+	Prefix               string `mapstructure:"prefix"`
+	Region               string `mapstructure:"region"`
+	Endpoint             string `mapstructure:"endpoint"`
+	ForcePathStyle       bool   `mapstructure:"forcePathStyle"`
+	KmsKeyId             string `mapstructure:"kmsKeyId"`
+	StorageClass         string `mapstructure:"storageClass"`
+	MaxAttempts          int    `mapstructure:"maxAttempts"`
+	UploadTimeoutSeconds int    `mapstructure:"uploadTimeoutSeconds"`
 }
 
 type LocalArchiveConfig struct {
