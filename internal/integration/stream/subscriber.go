@@ -304,6 +304,15 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 		}
 	}()
 
+	// An in-flight flush must finish (upload and checkpoint commit) even if a
+	// shutdown signal arrives midway; otherwise the committed batch is
+	// re-archived after restart. Bounded so shutdown cannot hang forever.
+	flushNow := func() error {
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		return s.flush(flushCtx)
+	}
+
 	flushTimer := time.NewTimer(time.Hour)
 	flushTimer.Stop()
 	idle := time.NewTimer(streamIdleTimeout)
@@ -321,7 +330,7 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 			return errors.New("no message or keepalive received within the idle timeout")
 
 		case <-flushTimer.C:
-			if err := s.flush(ctx); err != nil {
+			if err := flushNow(); err != nil {
 				return err
 			}
 
@@ -352,7 +361,7 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 				pending--
 				if len(s.buffer) >= s.opts.MaxEvents {
 					flushTimer.Stop()
-					if err := s.flush(ctx); err != nil {
+					if err := flushNow(); err != nil {
 						return err
 					}
 				}

@@ -552,3 +552,33 @@ func TestChaosNoLoss(t *testing.T) {
 		t.Fatalf("%d of %d events lost (seed %d)", missing, total, seed)
 	}
 }
+
+// A shutdown signal that arrives while a batch is being archived must not
+// abort the checkpoint commit (observed on ECS: SIGTERM between upload and
+// commit re-archived the batch after restart).
+func TestShutdownDuringFlushStillCommits(t *testing.T) {
+	h := newHarness(t, mocksf.Options{})
+	h.publish(50)
+	opts := h.options()
+	opts.MaxEvents = 50
+
+	client, closeFn := h.client()
+	defer closeFn()
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	h.sink.AfterStore = func(archive.ObjectMeta, int) error {
+		once.Do(cancel) // SIGTERM arrives after the upload, before the commit
+		return nil
+	}
+	err := NewSubscriber(opts, client, h.sink, h.store).Run(ctx)
+	if err != nil {
+		t.Fatalf("graceful shutdown during flush returned %v", err)
+	}
+	got, ok := h.store.Checkpoint(h.key)
+	if !ok || string(got) != string(mocksf.ReplayID(50)) {
+		t.Fatalf("checkpoint = %x, want the archived batch to be committed", got)
+	}
+	if missing, dups, _ := h.reconcile(); missing != 0 || dups != 0 {
+		t.Errorf("missing=%d duplicates=%d", missing, dups)
+	}
+}

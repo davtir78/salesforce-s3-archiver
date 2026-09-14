@@ -8,9 +8,13 @@
 #   DURATION=1200 bash scripts/chaos-aws.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Git Bash on Windows rewrites arguments that look like paths (e.g. /ecs/...).
+export MSYS_NO_PATHCONV=1
 TF="terraform -chdir=deploy/aws"
 
 DURATION=${DURATION:-1200}
+# Space-separated subset of: stop-stream stop-eventlog failover s3-deny stream-drop rest-faults
+ACTIONS=(${CHAOS_ACTIONS:-stop-stream stop-stream stop-eventlog failover s3-deny stream-drop rest-faults})
 EPS=${EPS:-50}
 OUT=${OUT:-dev/chaos-aws}
 mkdir -p "$OUT"
@@ -55,16 +59,16 @@ failover_done=0
 end=$((SECONDS + DURATION))
 while [ $SECONDS -lt $end ]; do
   sleep $((RANDOM % 40 + 30))
-  case $((RANDOM % 7)) in
-    0|1)
+  case "${ACTIONS[$((RANDOM % ${#ACTIONS[@]}))]}" in
+    stop-stream)
       t=$(task_of stream-collector)
       log "stop stream-collector task ${t##*/} (SIGTERM, ECS replaces it)"
       aws ecs stop-task --cluster "$CLUSTER" --task "$t" --reason chaos >/dev/null ;;
-    2)
+    stop-eventlog)
       t=$(task_of eventlog-collector)
       log "stop eventlog-collector task ${t##*/}"
       aws ecs stop-task --cluster "$CLUSTER" --task "$t" --reason chaos >/dev/null ;;
-    3)
+    failover)
       if [ $failover_done -eq 0 ]; then
         log "ElastiCache test-failover on $RG"
         aws elasticache test-failover --replication-group-id "$RG" --node-group-id 0001 >/dev/null \
@@ -73,19 +77,19 @@ while [ $SECONDS -lt $end ]; do
         log "expire all mock access tokens"
         post /admin/expire-tokens '{}'
       fi ;;
-    4)
+    s3-deny)
       log "deny S3 PutObject for 90s"
       DENY=$(echo "$ORIGINAL_POLICY" | sed "s#\"Statement\":\[#\"Statement\":[{\"Sid\":\"ChaosDenyWrites\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::${BUCKET}/*\"},#")
       aws s3api put-bucket-policy --bucket "$BUCKET" --policy "$DENY"
       sleep 90
       restore_policy
       log "S3 writes allowed again" ;;
-    5)
+    stream-drop)
       log "pub/sub streams drop after 300 events for 60s"
       post /admin/faults '{"dropStreamAfterEvents":300}'
       sleep 60
       post /admin/faults '{}' ;;
-    6)
+    rest-faults)
       log "fail next 5 REST requests + truncate next download"
       post /admin/faults '{"failRestRequests":5,"truncateNextDownload":100}' ;;
   esac
@@ -106,7 +110,7 @@ run_verify() {
   aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$arn"
   code=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$arn" --query 'tasks[0].containers[0].exitCode' --output text)
   aws logs get-log-events --log-group-name "$LOG_GROUP" --log-stream-name "ecs/verify/$id" \
-    --query 'events[].message' --output text > "$OUT/verify.json" 2>/dev/null
+    --query 'events[].message' --output text 2>/dev/null | tr '\t' '\n' > "$OUT/verify.json"
   echo "$code"
 }
 
