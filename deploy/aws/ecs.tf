@@ -45,6 +45,8 @@ resource "aws_ssm_parameter" "sf_client_secret" {
 }
 
 locals {
+  instance      = "${var.name}-run${var.run_id}"
+  prefix        = "archive/run-${var.run_id}"
   image         = "${aws_ecr_repository.this.repository_url}:${var.image_tag}"
   mock_host     = "mock-salesforce.${aws_service_discovery_private_dns_namespace.this.name}"
   token_url     = var.use_mock_salesforce ? "http://${local.mock_host}:8080" : var.salesforce_token_url
@@ -57,7 +59,7 @@ locals {
     logLevel: info
     metricsAddr: ":9090"
     eventStream:
-      instanceName: ${var.name}
+      instanceName: ${local.instance}
       auth:
         tokenUrl: ${local.token_url}
         clientCred:
@@ -85,7 +87,7 @@ locals {
     archive:
       s3:
         bucket: ${aws_s3_bucket.archive.bucket}
-        prefix: archive
+        prefix: ${local.prefix}
         region: ${var.region}
         kmsKeyId: ${aws_kms_key.archive.arn}
   YAML
@@ -95,7 +97,7 @@ locals {
     logLevel: info
     metricsAddr: ":9090"
     eventLog:
-      instanceName: ${var.name}
+      instanceName: ${local.instance}
       apiVer: "64.0"
       requestTimeout: 30
       pollIntervalSeconds: ${var.use_mock_salesforce ? 30 : 300}
@@ -124,7 +126,7 @@ locals {
     archive:
       s3:
         bucket: ${aws_s3_bucket.archive.bucket}
-        prefix: archive
+        prefix: ${local.prefix}
         region: ${var.region}
         kmsKeyId: ${aws_kms_key.archive.arn}
   YAML
@@ -234,7 +236,7 @@ resource "aws_ecs_task_definition" "verify" {
     image     = local.image
     essential = true
     command = concat(
-      ["sf-archive-verify", "-bucket", aws_s3_bucket.archive.bucket, "-prefix", "archive", "-region", var.region],
+      ["sf-archive-verify", "-bucket", aws_s3_bucket.archive.bucket, "-prefix", local.prefix, "-region", var.region],
       var.use_mock_salesforce ? ["-ledger", "http://${local.mock_host}:8080/admin/ledger"] : []
     )
     logConfiguration = local.log_config

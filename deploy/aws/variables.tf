@@ -22,6 +22,12 @@ variable "admin_cidr" {
   default     = ""
 }
 
+variable "run_id" {
+  description = "Test run identifier. Changing it gives collectors a fresh instance name (checkpoint and watermark keys) and S3 prefix, e.g. after the mock restarts with a new ledger."
+  type        = string
+  default     = "1"
+}
+
 variable "use_mock_salesforce" {
   description = "Deploy the mock Salesforce service and point collectors at it."
   type        = bool
