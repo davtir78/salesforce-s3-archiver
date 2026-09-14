@@ -128,4 +128,35 @@ func TestIntegrityCheck(t *testing.T) {
 	if err == nil {
 		t.Errorf("Integrity check didn't catch an empty event stream topics list")
 	}
+
+	conf.EventStream = rightStreamConf()
+	conf.EventStream.Cache = nil
+	if IntegrityCheck(&conf) == nil {
+		t.Errorf("Integrity check must require Redis for durable checkpoints")
+	}
+
+	conf.EventStream = rightStreamConf()
+	conf.EventStream.InitialReplay = "sometimes"
+	if IntegrityCheck(&conf) == nil {
+		t.Errorf("Integrity check didn't catch an invalid initialReplay")
+	}
+	conf.EventStream.InitialReplay = "earliest"
+	if err := IntegrityCheck(&conf); err != nil {
+		t.Errorf("Integrity check rejected initialReplay earliest: %v", err)
+	}
+
+	conf.EventStream = rightStreamConf()
+	conf.EventStream.Topics = []string{"one", "one"}
+	if IntegrityCheck(&conf) == nil {
+		t.Errorf("Integrity check didn't catch duplicate topics")
+	}
+
+	// Client credentials are accepted by the stream collector (upstream already
+	// shares CheckAuth between collectors).
+	conf.EventStream = rightStreamConf()
+	conf.EventStream.Auth.UserPass = nil
+	conf.EventStream.Auth.ClientCred = &config.ClientCredAuth{ClientId: "id", ClientSecret: "secret"}
+	if err := IntegrityCheck(&conf); err != nil {
+		t.Errorf("Integrity check rejected client credentials auth: %v", err)
+	}
 }
