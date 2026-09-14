@@ -25,6 +25,13 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0`)
 
+	clearScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('DEL', KEYS[2])
+  return 1
+end
+return 0`)
+
 	releaseScript = redis.NewScript(`
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
@@ -131,4 +138,15 @@ func (l *redisLease) Renew(ctx context.Context) error {
 
 func (l *redisLease) Release(ctx context.Context) error {
 	return releaseScript.Run(ctx, l.store.Client, []string{l.leaseKey}, l.store.Owner).Err()
+}
+
+func (l *redisLease) Clear(ctx context.Context) error {
+	res, err := clearScript.Run(ctx, l.store.Client, []string{l.leaseKey, l.replayKey}, l.store.Owner).Int()
+	if err != nil {
+		return fmt.Errorf("clearing checkpoint %s: %w", l.replayKey, err)
+	}
+	if res != 1 {
+		return ErrLeaseLost
+	}
+	return nil
 }

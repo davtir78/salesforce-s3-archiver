@@ -5,11 +5,14 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/davtir78/salesforce-s3-archiver/internal/archive"
 	"github.com/davtir78/salesforce-s3-archiver/internal/cache"
@@ -27,6 +30,8 @@ func main() {
 func run() int {
 	configPath := flag.String("config", "config.yml", "path to the YAML config file")
 	version := flag.Bool("version", false, "print version and exit")
+	resetTopics := flag.String("reset-checkpoints", "", "operator recovery: delete stored replay checkpoints for these comma-separated topics (or \"all\") and exit. The collector must be stopped; on next start initialReplay decides where each topic resumes")
+	confirm := flag.Bool("confirm", false, "required with -reset-checkpoints")
 	flag.Parse()
 	if *version {
 		fmt.Println(archive.CollectorVersion)
@@ -62,13 +67,61 @@ func run() int {
 		return 1
 	}
 
+	store := checkpoint.NewRedisStore(redisClient, conf.EventStream.Cache.Redis.KeyPrefix)
+	if *resetTopics != "" {
+		return resetCheckpoints(ctx, &conf, store, *resetTopics, *confirm)
+	}
+
 	metrics.Serve(ctx, conf.MetricsAddr)
 	log.Infof("Starting stream collector %s for %d topic(s), version %s", conf.EventStream.Name, len(conf.EventStream.Topics), archive.CollectorVersion)
 
-	store := checkpoint.NewRedisStore(redisClient, conf.EventStream.Cache.Redis.KeyPrefix)
 	if err := stream.RunService(ctx, &conf, sink, store, stream.DefaultClientFactory(&conf)); err != nil {
 		log.Errorf("Stream collector failed: %v", err)
 		return 1
 	}
+	return 0
+}
+
+// resetCheckpoints deletes replay checkpoints so topics can be re-bootstrapped
+// after a replay ID was rejected (e.g. retention expired or sandbox refresh).
+// Any events between the old checkpoint and the new start point must be
+// recovered another way (EventLogFiles or stored event objects).
+func resetCheckpoints(ctx context.Context, conf *config.Config, store checkpoint.Store, topicsArg string, confirm bool) int {
+	topics := conf.EventStream.Topics
+	if topicsArg != "all" {
+		topics = strings.Split(topicsArg, ",")
+	}
+	if !confirm {
+		log.Errorf("Refusing to reset checkpoints for %v without -confirm. This can create a gap in the archive.", topics)
+		return 2
+	}
+	ttl := time.Duration(conf.EventStream.LeaseTTLSeconds) * time.Second
+	if ttl == 0 {
+		ttl = 30 * time.Second
+	}
+	for _, topic := range topics {
+		acquireCtx, cancel := context.WithTimeout(ctx, 2*ttl)
+		lease, err := store.Acquire(acquireCtx, checkpoint.Key(conf.EventStream.Name, topic), ttl)
+		cancel()
+		if err != nil {
+			log.Errorf("Could not acquire the lease for %s (is a collector still running?): %v", topic, err)
+			return 1
+		}
+		old, ok, err := lease.Load(ctx)
+		if err == nil {
+			err = lease.Clear(ctx)
+		}
+		lease.Release(ctx)
+		if err != nil {
+			log.Errorf("Resetting checkpoint for %s failed: %v", topic, err)
+			return 1
+		}
+		if ok {
+			log.Warnf("CHECKPOINT RESET topic=%s previousReplayId=%s: events after this point that are no longer retained by Salesforce must be backfilled", topic, base64.StdEncoding.EncodeToString(old))
+		} else {
+			log.Infof("No checkpoint stored for %s", topic)
+		}
+	}
+	log.Infof("Reset complete. Start the collector with eventStream.initialReplay set to EARLIEST or LATEST.")
 	return 0
 }

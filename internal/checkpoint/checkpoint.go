@@ -37,6 +37,8 @@ type Lease interface {
 	Renew(ctx context.Context) error
 	// Release gives up the lease if still held.
 	Release(ctx context.Context) error
+	// Clear deletes the stored checkpoint (operator reset) if the lease is still held.
+	Clear(ctx context.Context) error
 }
 
 // Key builds the lease/checkpoint key for a stream instance and topic.
