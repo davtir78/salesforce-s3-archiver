@@ -387,6 +387,11 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 			// This keeps quiet topics from ageing out of the retention window.
 			if len(resp.GetEvents()) == 0 && len(s.buffer) == 0 && resp.GetPendingNumRequested() > 0 && len(resp.GetLatestReplayId()) > 0 {
 				if err := s.commit(ctx, resp.GetLatestReplayId(), nil); err != nil {
+					if ctx.Err() != nil {
+						// Shutting down: a keepalive checkpoint is only an optimisation
+						// (nothing is buffered), so an interrupted commit is a clean stop.
+						return nil
+					}
 					return err
 				}
 			}
