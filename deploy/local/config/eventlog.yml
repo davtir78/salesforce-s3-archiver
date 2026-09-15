@@ -1,0 +1,43 @@
+version: "3.0"
+logLevel: info
+metricsAddr: ":9090"
+
+eventLog:
+  instanceName: local
+  apiVer: "64.0"
+  requestTimeout: 30
+  pollIntervalSeconds: 15
+  watermarkOverlapMinutes: 60
+  auth:
+    tokenUrl: http://mock-salesforce:8080
+    clientCred:
+      clientId: $SF_CLIENT_ID
+      clientSecret: $SF_CLIENT_SECRET
+  cache:
+    redis:
+      host: valkey
+      port: 6379
+      password: $REDIS_PASSWORD
+      expireDays: 7
+      tls:
+        enabled: true
+        caFile: /certs/ca.crt
+  initialTimeInterval:
+    hours: 24
+  customQueries:
+    - soql:
+        select: [Id, Action, Section, CreatedDate, CreatedById]
+        from: SetupAuditTrail
+      timestamp: CreatedDate
+      apiName: rest
+  limits:
+    names: [DailyApiRequests, DailyStreamingApiEvents]
+
+archive:
+  s3:
+    bucket: archive
+    prefix: local
+    endpoint: http://minio:9000
+    forcePathStyle: true
+    region: us-east-1
+    uploadTimeoutSeconds: 20

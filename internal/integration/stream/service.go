@@ -20,14 +20,15 @@ import (
 func OptionsFromConfig(conf *config.Config, topic string) SubscriberOptions {
 	es := conf.EventStream
 	return SubscriberOptions{
-		Topic:         topic,
-		Instance:      es.Name,
-		OrgId:         conf.OrgId,
-		Appetite:      es.Appetite,
-		MaxEvents:     es.Batch.MaxEvents,
-		MaxAge:        time.Duration(es.Batch.MaxAgeSeconds) * time.Second,
-		InitialReplay: es.InitialReplay,
-		LeaseTTL:      time.Duration(es.LeaseTTLSeconds) * time.Second,
+		Topic:                topic,
+		Instance:             es.Name,
+		OrgId:                conf.OrgId,
+		Appetite:             es.Appetite,
+		MaxEvents:            es.Batch.MaxEvents,
+		MaxAge:               time.Duration(es.Batch.MaxAgeSeconds) * time.Second,
+		InitialReplay:        es.InitialReplay,
+		LeaseTTL:             time.Duration(es.LeaseTTLSeconds) * time.Second,
+		ShutdownFlushTimeout: time.Duration(es.ShutdownFlushTimeoutSeconds) * time.Second,
 	}
 }
 

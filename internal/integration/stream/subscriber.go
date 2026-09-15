@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/davtir78/salesforce-s3-archiver/internal/archive"
@@ -76,6 +77,11 @@ type SubscriberOptions struct {
 	LeaseTTL      time.Duration
 	// Attempts for each archive write before giving up (fatal).
 	WriteAttempts int
+	// Once shutdown is signalled, how long an in-flight or final flush may take
+	// before it is abandoned (checkpoint not advanced). Keep it below the
+	// orchestrator's stop timeout (e.g. ECS stopTimeout, compose
+	// stop_grace_period) so the process exits before SIGKILL.
+	ShutdownFlushTimeout time.Duration
 	// Maximum reconnect backoff.
 	MaxBackoff time.Duration
 	// Base retry delay (tests use small values).
@@ -101,6 +107,9 @@ func (o *SubscriberOptions) defaults() {
 	}
 	if o.WriteAttempts <= 0 {
 		o.WriteAttempts = 5
+	}
+	if o.ShutdownFlushTimeout <= 0 {
+		o.ShutdownFlushTimeout = 90 * time.Second
 	}
 	if o.MaxBackoff <= 0 {
 		o.MaxBackoff = 60 * time.Second
@@ -318,7 +327,7 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 			s.buffer = nil
 			return
 		}
-		flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		flushCtx, flushCancel := s.flushContext(ctx)
 		defer flushCancel()
 		if err := s.flush(flushCtx); err != nil {
 			if retErr == nil || !IsFatal(retErr) {
@@ -326,6 +335,15 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 			}
 		}
 	}()
+
+	// An in-flight flush must finish (upload and checkpoint commit) even if a
+	// shutdown signal arrives midway; otherwise the committed batch is
+	// re-archived after restart. Bounded so shutdown cannot hang forever.
+	flushNow := func() error {
+		flushCtx, cancel := s.flushContext(ctx)
+		defer cancel()
+		return s.flush(flushCtx)
+	}
 
 	flushTimer := time.NewTimer(time.Hour)
 	flushTimer.Stop()
@@ -344,7 +362,7 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 			return errors.New("no message or keepalive received within the idle timeout")
 
 		case <-flushTimer.C:
-			if err := s.flush(ctx); err != nil {
+			if err := flushNow(); err != nil {
 				return err
 			}
 
@@ -375,7 +393,7 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 				pending--
 				if len(s.buffer) >= s.opts.MaxEvents {
 					flushTimer.Stop()
-					if err := s.flush(ctx); err != nil {
+					if err := flushNow(); err != nil {
 						return err
 					}
 				}
@@ -592,5 +610,30 @@ func sleep(ctx context.Context, d time.Duration) error {
 		return ctx.Err()
 	case <-t.C:
 		return nil
+	}
+}
+
+// flushContext returns a context for archiving and committing a batch that is
+// not cancelled by the shutdown signal itself, so an in-flight flush can finish.
+// Once ctx is cancelled the flush has ShutdownFlushTimeout to complete.
+func (s *Subscriber) flushContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	flushCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	var (
+		mu    sync.Mutex
+		timer *time.Timer
+	)
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		timer = time.AfterFunc(s.opts.ShutdownFlushTimeout, cancel)
+	})
+	return flushCtx, func() {
+		stop()
+		mu.Lock()
+		if timer != nil {
+			timer.Stop()
+		}
+		mu.Unlock()
+		cancel()
 	}
 }

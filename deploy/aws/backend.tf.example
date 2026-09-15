@@ -1,0 +1,17 @@
+# Remote state for shared or long-lived stacks. Local state (the default) keeps
+# generated secrets such as the ElastiCache passwords in terraform.tfstate on
+# the machine that ran Terraform; use an encrypted, access-controlled backend
+# for anything beyond a throwaway test stack.
+#
+# Copy to backend.tf, create the bucket and lock table, then run
+#   terraform init -migrate-state
+#
+# terraform {
+#   backend "s3" {
+#     bucket       = "my-terraform-state"
+#     key          = "salesforce-s3-archiver/terraform.tfstate"
+#     region       = "ap-southeast-2"
+#     encrypt      = true
+#     use_lockfile = true
+#   }
+# }

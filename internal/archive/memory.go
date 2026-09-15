@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"time"
 )
 
 // MemorySink keeps objects in memory. It is used by tests and supports fault
@@ -26,6 +27,9 @@ type MemorySink struct {
 	// an error simulates a crash between a successful upload and the caller
 	// learning about it.
 	AfterStore func(meta ObjectMeta, writeNumber int) error
+	// StoreDelay simulates a slow store; the wait is cut short if the write
+	// context is cancelled.
+	StoreDelay time.Duration
 }
 
 func NewMemorySink() *MemorySink {
@@ -44,6 +48,12 @@ func (s *MemorySink) Write(ctx context.Context, meta ObjectMeta, fill func(w Rec
 		}
 	}
 	m, err := encodeObject(ctx, meta, fill, func(ctx context.Context, body *os.File, m *Manifest) error {
+		if s.StoreDelay > 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(s.StoreDelay):
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}

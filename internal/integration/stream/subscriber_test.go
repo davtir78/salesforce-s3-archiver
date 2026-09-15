@@ -554,6 +554,36 @@ func TestChaosNoLoss(t *testing.T) {
 	}
 }
 
+// A shutdown signal that arrives while a batch is being archived must not
+// abort the checkpoint commit (observed on ECS: SIGTERM between upload and
+// commit re-archived the batch after restart).
+func TestShutdownDuringFlushStillCommits(t *testing.T) {
+	h := newHarness(t, mocksf.Options{})
+	h.publish(50)
+	opts := h.options()
+	opts.MaxEvents = 50
+
+	client, closeFn := h.client()
+	defer closeFn()
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	h.sink.AfterStore = func(archive.ObjectMeta, int) error {
+		once.Do(cancel) // SIGTERM arrives after the upload, before the commit
+		return nil
+	}
+	err := NewSubscriber(opts, client, h.sink, h.store).Run(ctx)
+	if err != nil {
+		t.Fatalf("graceful shutdown during flush returned %v", err)
+	}
+	got, ok := h.store.Checkpoint(h.key)
+	if !ok || string(got) != string(mocksf.ReplayID(50)) {
+		t.Fatalf("checkpoint = %x, want the archived batch to be committed", got)
+	}
+	if missing, dups, _ := h.reconcile(); missing != 0 || dups != 0 {
+		t.Errorf("missing=%d duplicates=%d", missing, dups)
+	}
+}
+
 func TestShutdownFlushFailureIsReported(t *testing.T) {
 	h := newHarness(t, mocksf.Options{})
 	opts := h.options()
@@ -621,6 +651,32 @@ func TestReadinessWaitsForEveryLease(t *testing.T) {
 	}
 	if metrics.IsReady() {
 		t.Errorf("must not be ready after shutdown")
+	}
+}
+
+// A final flush that cannot finish must be abandoned within the shutdown
+// budget, so the process exits before the orchestrator's SIGKILL.
+func TestShutdownFlushIsBoundedByBudget(t *testing.T) {
+	h := newHarness(t, mocksf.Options{})
+	opts := h.options()
+	opts.MaxEvents = 10000
+	opts.MaxAge = time.Hour
+	opts.ShutdownFlushTimeout = 300 * time.Millisecond
+	_, stop := h.run(opts, h.store)
+	h.publish(20)
+	time.Sleep(500 * time.Millisecond)
+	h.sink.StoreDelay = 30 * time.Second // S3 is hanging
+
+	start := time.Now()
+	err := stop()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("shutdown took %s, exceeding the flush budget", elapsed)
+	}
+	if err == nil {
+		t.Errorf("an abandoned final flush must be reported as an error")
+	}
+	if _, ok := h.store.Checkpoint(h.key); ok {
+		t.Errorf("checkpoint must not advance when the flush was abandoned")
 	}
 }
 
