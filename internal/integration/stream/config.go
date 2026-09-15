@@ -3,7 +3,7 @@ package stream
 import (
 	"errors"
 
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
 )
 
 // Config checks specific to the event stream integration

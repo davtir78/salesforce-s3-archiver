@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/cache"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/eventlog/query"
+	"github.com/davtir78/salesforce-s3-archiver/internal/cache"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/eventlog/query"
 )
 
 const LoginEventType = "Login"

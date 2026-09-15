@@ -10,13 +10,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/davtir78/salesforce-s3-archiver/internal/cache"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/common"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/proto"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
+	"github.com/davtir78/salesforce-s3-archiver/internal/oauth"
 	"github.com/linkedin/goavro/v2"
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/cache"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream/pubsub/common"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream/pubsub/proto"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/oauth"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -256,7 +256,7 @@ func (c *PubSubClient) Subscribe(subsOpts SubscribeOpts, db cache.Cache, instanc
 
 	// Store the Replay ID in the cache
 	curReplayId := subsOpts.ReplayId
-	err = subsOpts.Cache.SetCacheVal(subsOpts.ReplayIdKey, string(curReplayId))
+	err = cache.SetPersistent(subsOpts.Cache, subsOpts.ReplayIdKey, string(curReplayId))
 	if err != nil {
 		log.Debugf("Error updating ReplayId = %s", err)
 	}
@@ -306,7 +306,7 @@ func (c *PubSubClient) Subscribe(subsOpts SubscribeOpts, db cache.Cache, instanc
 
 			// Store the Replay ID in the cache
 			curReplayId = event.GetReplayId()
-			err = subsOpts.Cache.SetCacheVal(subsOpts.ReplayIdKey, string(curReplayId))
+			err = cache.SetPersistent(subsOpts.Cache, subsOpts.ReplayIdKey, string(curReplayId))
 			if err != nil {
 				log.Debugf("Error updating ReplayId = %s", err)
 			}

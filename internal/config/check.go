@@ -2,9 +2,10 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 )
 
 func CheckUrl(urlStr string) bool {
@@ -107,14 +108,50 @@ func CheckClientCredCredentials(clientCredAuth *ClientCredAuth) error {
 func CheckCache(cache *CacheConfig) error {
 	if cache == nil {
 		log.Warnf("Cache not defined.")
-	} else {
-		if cache.Redis == nil {
-			log.Warnf("Redis DB not defined.")
-		} else {
-			if cache.Redis.Host == "" {
-				return errors.New("Empty 'cache.redis.host'")
-			}
+		return nil
+	}
+	if cache.Redis == nil {
+		log.Warnf("Redis DB not defined.")
+		return nil
+	}
+	r := cache.Redis
+	if r.Host == "" {
+		return errors.New("Empty 'cache.redis.host'")
+	}
+	switch r.Mode {
+	case "", "standalone", "cluster":
+	default:
+		return fmt.Errorf("Invalid 'cache.redis.mode' '%s': expected 'standalone' or 'cluster'", r.Mode)
+	}
+	if r.IAMAuth.Enabled {
+		if !r.TLS.Enabled {
+			return errors.New("'cache.redis.iamAuth' requires 'cache.redis.tls.enabled: true'")
 		}
+		if r.IAMAuth.CacheName == "" || r.IAMAuth.UserId == "" {
+			return errors.New("'cache.redis.iamAuth' requires 'cacheName' and 'userId'")
+		}
+		if r.Password != "" {
+			return errors.New("'cache.redis.password' must be empty when 'iamAuth' is enabled")
+		}
+	}
+	if r.TLS.InsecureSkipVerify {
+		log.Warnf("'cache.redis.tls.insecureSkipVerify' is enabled; use only for local testing.")
+	}
+	return nil
+}
+
+func CheckArchive(archive *ArchiveConfig) error {
+	if archive.S3 == nil && archive.Local == nil {
+		return errors.New("An archive destination must be defined: 'archive.s3' or 'archive.local'")
+	}
+	if archive.S3 != nil && archive.Local != nil {
+		return errors.New("Only one archive destination may be defined: 'archive.s3' or 'archive.local'")
+	}
+	if archive.S3 != nil && archive.S3.Bucket == "" {
+		return errors.New("Empty 'archive.s3.bucket'")
+	}
+	if archive.Local != nil && archive.Local.Dir == "" {
+		return errors.New("Empty 'archive.local.dir'")
 	}
 	return nil
 }

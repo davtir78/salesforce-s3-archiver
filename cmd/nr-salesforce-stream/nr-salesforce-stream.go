@@ -7,14 +7,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/cache"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream/pubsub/common"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream/pubsub/grpcclient"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/stream/pubsub/proto"
+	"github.com/davtir78/salesforce-s3-archiver/internal/cache"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/common"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/grpcclient"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/proto"
 
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 )
 
 var integrationConf config.Config
@@ -52,7 +52,7 @@ func main() {
 	streamChannel := make(chan map[string]any)
 	watchdogChannel := make(chan struct{})
 
-	streamComponent, err := stream.NewStreamComponent(exporter, watchdogChannel, streamChannel, integrationConf.Format, integrationConf.EventStream.Name)
+	streamComponent, err := stream.NewStreamComponent(exporter, watchdogChannel, streamChannel, "events", integrationConf.EventStream.Name)
 	if err != nil {
 		log.Errorf("Error creating stream component = %s", err)
 		os.Exit(1)
@@ -85,7 +85,11 @@ func readEventStreams(ch chan<- map[string]any, topics []string) {
 }
 
 func subscribeToTopic(topicName string, ch chan<- map[string]any) {
-	db := cache.BuildCache(integrationConf.EventStream.Cache)
+	db, err := cache.BuildCache(integrationConf.EventStream.Cache)
+	if err != nil {
+		log.Errorf("could not build cache: %s", err)
+		os.Exit(1)
+	}
 
 	log.Debugf("Creating gRPC client...")
 	client, err := grpcclient.NewGRPCClient()

@@ -4,13 +4,13 @@ import (
 	"context"
 	"os"
 
+	"github.com/davtir78/salesforce-s3-archiver/internal/cache"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/eventlog"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration"
 	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/exporters"
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
 	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/pipeline"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/cache"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/eventlog"
 )
 
 const (
@@ -84,7 +84,7 @@ func main() {
 		i.DryRun,
 	)
 
-	switch integrationConf.Format {
+	switch "events" {
 	case "events":
 		log.Debugf("Output data format: Events")
 		createEventsPipeline(i, newRelicExporter)
@@ -113,7 +113,11 @@ func createEventsPipeline(i *integration.LabsIntegration, newRelicExporter *expo
 
 	// Add one Salesforce Events Receiver component per instance
 	instance := integrationConf.EventLog
-	db := cache.BuildCache(instance.Cache)
+	db, err := cache.BuildCache(instance.Cache)
+	if err != nil {
+		log.Errorf("could not build cache: %s", err)
+		os.Exit(1)
+	}
 	sfdcReceiver := eventlog.NewSalesforceEventsReceiver(i, instance, db)
 	ep.AddReceiver(sfdcReceiver)
 
@@ -126,7 +130,11 @@ func createLogsPipeline(i *integration.LabsIntegration, newRelicExporter *export
 
 	// Add one Salesforce Logs Receiver component per instance
 	instance := integrationConf.EventLog
-	db := cache.BuildCache(instance.Cache)
+	db, err := cache.BuildCache(instance.Cache)
+	if err != nil {
+		log.Errorf("could not build cache: %s", err)
+		os.Exit(1)
+	}
 	sfdcReceiver := eventlog.NewSalesforceLogsReceiver(i, instance, db)
 	ep.AddReceiver(sfdcReceiver)
 

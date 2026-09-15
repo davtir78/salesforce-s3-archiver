@@ -14,13 +14,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/davtir78/salesforce-s3-archiver/internal/cache"
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/eventlog/query"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration"
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
 	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/model"
 	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/pipeline"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/cache"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/integration/eventlog/query"
 )
 
 const MaxLinesToRead = 100
@@ -391,7 +391,8 @@ func getLastRunFromCache(s SalesforceReceiverInterface, cacheKey string) time.Ti
 
 func setLastRunIntoCache(s SalesforceReceiverInterface, ts time.Time, cacheKey string) {
 	tsStr := strconv.FormatInt(ts.UnixMilli(), 10)
-	err := s.getDB().SetCacheVal(cacheKey, tsStr)
+	// Watermarks must not expire: a lost watermark silently resets the window.
+	err := cache.SetPersistent(s.getDB(), cacheKey, tsStr)
 	if err != nil {
 		log.Errorf("Error setting 'last_run_ts' into cache: %s", err.Error())
 	}

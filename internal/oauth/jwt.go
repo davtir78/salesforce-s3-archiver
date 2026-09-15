@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/davtir78/salesforce-s3-archiver/internal/config"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/newrelic/newrelic-labs-sdk/v2/pkg/integration/log"
-	"github.com/newrelic/newrelic-salesforce-exporter/internal/config"
 )
 
 func AuthWithJwt(tokenUrl string, auth *config.JwtAuth) (*AuthResponse, error) {
