@@ -128,5 +128,14 @@ func runStoreContract(t *testing.T, factory storeFactory) {
 	if got, _, _ := la2.Load(ctx); string(got) != "new" {
 		t.Errorf("checkpoint = %q, want new", got)
 	}
+	if err := la2.Clear(ctx); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if _, ok, _ := la2.Load(ctx); ok {
+		t.Errorf("checkpoint still present after Clear")
+	}
+	if err := lb.Clear(ctx); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("stale holder clear: got %v, want ErrLeaseLost", err)
+	}
 	la2.Release(ctx)
 }

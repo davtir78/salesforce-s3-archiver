@@ -80,6 +80,11 @@ var (
 		Help: "Current watermark for EventLogFile and custom query collection.",
 	}, []string{"name"})
 
+	EventLogQuarantined = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sfarchive_eventlog_quarantined_files_total",
+		Help: "EventLogFiles archived as raw lines because they could not be parsed. Needs investigation.",
+	}, []string{"event_type"})
+
 	LastSuccessfulPoll = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "sfarchive_eventlog_last_successful_poll_timestamp_seconds",
 		Help: "Time of the last poll that completed without errors.",

@@ -8,23 +8,28 @@ type SingleLimitResponse struct {
 }
 
 type GenericEventResponse struct {
-	TotalSize int              `json:"totalSize"`
-	Done      bool             `json:"done"`
-	Records   []map[string]any `json:"records"`
+	TotalSize      int              `json:"totalSize"`
+	Done           bool             `json:"done"`
+	NextRecordsUrl string           `json:"nextRecordsUrl"`
+	Records        []map[string]any `json:"records"`
 }
 
 type EventLogfileResponse struct {
-	TotalSize int                  `json:"totalSize"`
-	Done      bool                 `json:"done"`
-	Records   []EventLogfileRecord `json:"records"`
+	TotalSize      int                  `json:"totalSize"`
+	Done           bool                 `json:"done"`
+	NextRecordsUrl string               `json:"nextRecordsUrl"`
+	Records        []EventLogfileRecord `json:"records"`
 }
 
 type EventLogfileRecord struct {
-	Id          string `json:"Id"`
-	LogDate     string `json:"LogDate"`
-	CreatedDate string `json:"CreatedDate"`
-	LogFile     string `json:"LogFile"`
-	EventType   string `json:"EventType"`
+	Id            string `json:"Id"`
+	LogDate       string `json:"LogDate"`
+	CreatedDate   string `json:"CreatedDate"`
+	LogFile       string `json:"LogFile"`
+	EventType     string `json:"EventType"`
+	Interval      string `json:"Interval"`
+	Sequence      int    `json:"Sequence"`
+	LogFileLength int64  `json:"LogFileLength"`
 }
 
 type SoqlQuery struct {

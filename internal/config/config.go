@@ -85,14 +85,15 @@ type ArchiveConfig struct {
 }
 
 type S3Config struct {
-	Bucket         string `mapstructure:"bucket"`
-	Prefix         string `mapstructure:"prefix"`
-	Region         string `mapstructure:"region"`
-	Endpoint       string `mapstructure:"endpoint"`
-	ForcePathStyle bool   `mapstructure:"forcePathStyle"`
-	KmsKeyId       string `mapstructure:"kmsKeyId"`
-	StorageClass   string `mapstructure:"storageClass"`
-	MaxAttempts    int    `mapstructure:"maxAttempts"`
+	Bucket               string `mapstructure:"bucket"`
+	Prefix               string `mapstructure:"prefix"`
+	Region               string `mapstructure:"region"`
+	Endpoint             string `mapstructure:"endpoint"`
+	ForcePathStyle       bool   `mapstructure:"forcePathStyle"`
+	KmsKeyId             string `mapstructure:"kmsKeyId"`
+	StorageClass         string `mapstructure:"storageClass"`
+	MaxAttempts          int    `mapstructure:"maxAttempts"`
+	UploadTimeoutSeconds int    `mapstructure:"uploadTimeoutSeconds"`
 }
 
 type LocalArchiveConfig struct {
@@ -180,6 +181,12 @@ type EventLogConfig struct {
 	// Minutes subtracted from watermarks on each poll so late-arriving
 	// records are not skipped (default 60). Duplicates are removed downstream.
 	WatermarkOverlapMinutes uint `mapstructure:"watermarkOverlapMinutes"`
+	// Cancel an EventLogFile download that receives no data for this many
+	// seconds (default 120). Downloads have no overall timeout.
+	DownloadStallTimeoutSeconds uint `mapstructure:"downloadStallTimeoutSeconds"`
+	// Polls a file may fail CSV parsing before its raw lines are archived to a
+	// quarantine object and processing moves past it (default 3).
+	MalformedFileAttempts int `mapstructure:"malformedFileAttempts"`
 	// Records per archived object for custom queries (default 10000).
 	RecordsPerObject int `mapstructure:"recordsPerObject"`
 }

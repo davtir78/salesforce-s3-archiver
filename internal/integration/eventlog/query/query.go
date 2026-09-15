@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,56 +11,54 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/davtir78/salesforce-s3-archiver/internal/archive"
 	"github.com/davtir78/salesforce-s3-archiver/internal/cache"
 	"github.com/davtir78/salesforce-s3-archiver/internal/config"
 	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 	"github.com/davtir78/salesforce-s3-archiver/internal/oauth"
 )
 
+// Safety limit on followed nextRecordsUrl pages per query.
+const maxPages = 10000
+
 func auth(conf *config.EventLogConfig, db cache.Cache) (string, error) {
 	accessToken, ok := getTokenFromCache(conf, db).(string)
 	if ok {
 		log.Debugf("Got token from cache")
 		return accessToken, nil
-	} else {
-		log.Debugf("No token in cache, send login request")
-		login, err := oauth.Login(conf.Auth)
-		if err != nil {
-			return "", err
-		}
-		setTokenIntoCache(conf, db, login.AccessToken)
-		return login.AccessToken, nil
 	}
+	log.Debugf("No token in cache, send login request")
+	login, err := oauth.Login(conf.Auth)
+	if err != nil {
+		return "", err
+	}
+	setTokenIntoCache(conf, db, login.AccessToken)
+	return login.AccessToken, nil
 }
 
 func relogin(conf *config.EventLogConfig, db cache.Cache) error {
 	deleteTokenFromCache(conf, db)
 	_, reqErr := auth(conf, db)
-	if reqErr != nil {
-		return reqErr
-	}
-	return nil
+	return reqErr
 }
 
 func getTokenFromCache(conf *config.EventLogConfig, db cache.Cache) any {
 	val, err := db.GetCacheVal(tokenCacheKey(conf))
 	if err != nil {
-		log.Errorf("Error getting token from cache: %s", err.Error())
+		log.Warnf("Error getting token from cache: %s", err.Error())
 	}
 	return val
 }
 
 func setTokenIntoCache(conf *config.EventLogConfig, db cache.Cache, accessToken string) {
-	err := db.SetCacheVal(tokenCacheKey(conf), accessToken)
-	if err != nil {
-		log.Errorf("Error setting token into cache: %s", err.Error())
+	if err := db.SetCacheVal(tokenCacheKey(conf), accessToken); err != nil {
+		log.Warnf("Error setting token into cache: %s", err.Error())
 	}
 }
 
 func deleteTokenFromCache(conf *config.EventLogConfig, db cache.Cache) {
-	err := db.DelCacheVal(tokenCacheKey(conf))
-	if err != nil {
-		log.Errorf("Error deleting token from cache: %s", err.Error())
+	if err := db.DelCacheVal(tokenCacheKey(conf)); err != nil {
+		log.Warnf("Error deleting token from cache: %s", err.Error())
 	}
 }
 
@@ -68,91 +67,160 @@ func tokenCacheKey(conf *config.EventLogConfig) string {
 }
 
 func generateError(resp *http.Response) error {
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return fmt.Errorf("Error %d (could not read the response body)", resp.StatusCode)
-	} else {
-		return fmt.Errorf("Error %d, body: %s", resp.StatusCode, respBytes)
 	}
+	return fmt.Errorf("Error %d, body: %s", resp.StatusCode, respBytes)
 }
 
-// Request EventLogFile object.
-// Result: List of log files. Each one being a relative path to download a CSV file.
-func RequestLogFiles(conf *config.EventLogConfig, db cache.Cache, since time.Time, until time.Time) (EventLogfileResponse, error) {
-	soqlModel := MakeSoqlQuery("EventLogFile", "Id", "EventType", "CreatedDate", "LogDate", "LogFile")
+// getJSON runs a GET request and decodes a 200 response into v.
+func getJSON(ctx context.Context, conf *config.EventLogConfig, db cache.Cache, url string, v any) error {
+	resp, err := request(ctx, conf, db, url, false)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return generateError(resp)
+	}
+	// Keep numbers exact (json.Number) instead of float64, which loses
+	// precision above 2^53.
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	return dec.Decode(v)
+}
+
+// RequestLogFiles lists EventLogFile records created in [since, until],
+// ordered by CreatedDate, following every result page.
+func RequestLogFiles(ctx context.Context, conf *config.EventLogConfig, db cache.Cache, since time.Time, until time.Time) ([]EventLogfileRecord, error) {
+	soqlModel := MakeSoqlQuery("EventLogFile", "Id", "EventType", "CreatedDate", "LogDate", "LogFile", "Interval", "Sequence", "LogFileLength")
 	if !conf.NoInterval {
 		soqlModel.AndWhere("Interval = 'Hourly'")
 	}
 	soqlModel.AndWhere("CreatedDate >= " + since.UTC().Format(time.RFC3339))
 	soqlModel.AndWhere("CreatedDate <= " + until.UTC().Format(time.RFC3339))
-	// Apply EventType filter
 	if len(conf.EventTypes) > 0 {
-		eventTypeFilter := make([]string, 0)
+		eventTypeFilter := make([]string, 0, len(conf.EventTypes))
 		for _, eventType := range conf.EventTypes {
-			eventTypeFilter = append(eventTypeFilter, "EventType"+" = "+"'"+eventType+"'")
+			eventTypeFilter = append(eventTypeFilter, "EventType = '"+eventType+"'")
 		}
 		soqlModel.AndOrWhere(eventTypeFilter...)
 	}
+	// Upstream assumed chronological order without asking for it.
+	soqlModel.Tail("ORDER BY CreatedDate ASC, Id ASC")
 	soql := soqlModel.Build()
 
 	log.Debugf("Run EventLogFile SOQL query: %s", soql)
 
 	url := conf.Auth.TokenUrl + "/services/data/v" + conf.ApiVer + "/query?q=" + soql
+	var all []EventLogfileRecord
+	for page := 0; url != ""; page++ {
+		if page >= maxPages {
+			return nil, fmt.Errorf("EventLogFile query exceeded %d pages", maxPages)
+		}
+		var response EventLogfileResponse
+		if err := getJSON(ctx, conf, db, url, &response); err != nil {
+			return nil, err
+		}
+		all = append(all, response.Records...)
+		url = ""
+		if !response.Done && response.NextRecordsUrl != "" {
+			url = conf.Auth.TokenUrl + response.NextRecordsUrl
+		}
+	}
+	return all, nil
+}
 
-	resp, err := request(conf, db, url, false)
+// DownloadCsvFile downloads a log file into dir and returns its path. The
+// download is verified against the advertised length; a partial file is
+// deleted and reported as an error.
+func DownloadCsvFile(ctx context.Context, conf *config.EventLogConfig, db cache.Cache, record *EventLogfileRecord, dir string) (string, error) {
+	// Large files may legitimately take longer than requestTimeout, so instead of
+	// an overall deadline the download is cancelled when no bytes arrive for
+	// the stall timeout (covering both the response headers and the body).
+	stall := time.Duration(conf.DownloadStallTimeoutSeconds) * time.Second
+	if stall <= 0 {
+		stall = DefaultDownloadStallTimeout
+	}
+	dlCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	watchdog := time.AfterFunc(stall, func() {
+		cancel(fmt.Errorf("no data received for %s", stall))
+	})
+	defer watchdog.Stop()
+
+	resp, err := requestWithTimeout(dlCtx, conf, db, conf.Auth.TokenUrl+record.LogFile, 0, false)
 	if err != nil {
-		return EventLogfileResponse{}, err
+		return "", withCause(dlCtx, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 200 {
-		respBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return EventLogfileResponse{}, err
-		}
-
-		var response EventLogfileResponse
-		err = json.Unmarshal(respBytes, &response)
-		if err != nil {
-			return EventLogfileResponse{}, err
-		}
-
-		return response, nil
-	} else {
-		return EventLogfileResponse{}, generateError(resp)
+	if resp.StatusCode != http.StatusOK {
+		return "", generateError(resp)
 	}
-}
 
-// Download a CSV file to disk.
-// Result: Local path to downloaded file.
-func DownloadCsvFile(conf *config.EventLogConfig, db cache.Cache, record *EventLogfileRecord) (string, error) {
-	resp, err := request(conf, db, conf.Auth.TokenUrl+record.LogFile, false)
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	outFile, err := os.CreateTemp(dir, "sf-elf-"+sanitizeFileName(record.Id)+"-*.csv")
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		filePath := csvFilePath(record)
-		outFile, err := os.Create(filePath)
-		if err != nil {
-			return "", err
-		}
-		defer outFile.Close()
-
-		_, err = io.Copy(outFile, resp.Body)
-
-		return filePath, err
-	} else {
-		return "", generateError(resp)
+	filePath := outFile.Name()
+	watchdog.Reset(stall)
+	written, copyErr := io.Copy(outFile, &progressReader{r: resp.Body, onProgress: func() { watchdog.Reset(stall) }})
+	copyErr = withCause(dlCtx, copyErr)
+	closeErr := outFile.Close()
+	if copyErr == nil {
+		copyErr = closeErr
 	}
+	if copyErr == nil && resp.ContentLength >= 0 && written != resp.ContentLength {
+		copyErr = fmt.Errorf("downloaded %d bytes, expected Content-Length %d", written, resp.ContentLength)
+	}
+	if copyErr == nil && record.LogFileLength > 0 && written != record.LogFileLength {
+		copyErr = fmt.Errorf("downloaded %d bytes, expected LogFileLength %d", written, record.LogFileLength)
+	}
+	if copyErr != nil {
+		os.Remove(filePath)
+		return "", fmt.Errorf("downloading log file %s: %w", record.Id, copyErr)
+	}
+	return filePath, nil
 }
 
-// Send a SOQL request.
-// Result: response object.
-func RequestCustomQuery(customQuery *config.QueryConfig, conf *config.EventLogConfig, db cache.Cache, since time.Time, until time.Time) (GenericEventResponse, error) {
+// DefaultDownloadStallTimeout cancels an EventLogFile download that receives no data for this long.
+const DefaultDownloadStallTimeout = 120 * time.Second
+
+type progressReader struct {
+	r          io.Reader
+	onProgress func()
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.onProgress()
+	}
+	return n, err
+}
+
+// withCause reports why a context was cancelled (e.g. the stall watchdog).
+func withCause(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
+		return fmt.Errorf("%w: %v", err, cause)
+	}
+	return err
+}
+
+// RequestCustomQuery runs a custom SOQL query for [since, until], following every page.
+func RequestCustomQuery(ctx context.Context, customQuery *config.QueryConfig, conf *config.EventLogConfig, db cache.Cache, since time.Time, until time.Time) ([]map[string]any, error) {
 	soqlModel := MakeSoqlQuery(customQuery.Soql.From, customQuery.Soql.Select...)
-	soqlModel.AndWhere(customQuery.Soql.Where)
+	if customQuery.Soql.Where != "" {
+		soqlModel.AndWhere(customQuery.Soql.Where)
+	}
 	soqlModel.AndWhere(customQuery.Timestamp + " >= " + since.UTC().Format(time.RFC3339))
 	if customQuery.EndTimestamp == "" {
 		soqlModel.AndWhere(customQuery.Timestamp + " <= " + until.UTC().Format(time.RFC3339))
@@ -164,137 +232,116 @@ func RequestCustomQuery(customQuery *config.QueryConfig, conf *config.EventLogCo
 
 	log.Debugf("Run custom SOQL query: %s", soql)
 
-	// Base URL
 	url := conf.Auth.TokenUrl + "/services/data/v" + customQuery.ApiVer
-
 	if customQuery.ApiName == "rest" {
-		// REST API
 		url += "/query"
 	} else {
-		// TOOLING API
 		url += "/tooling/query"
 	}
-
-	// Add SOQL query
 	url += "?q=" + soql
 
-	resp, err := request(conf, db, url, false)
-	if err != nil {
-		return GenericEventResponse{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		respBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return GenericEventResponse{}, err
+	var all []map[string]any
+	for page := 0; url != ""; page++ {
+		if page >= maxPages {
+			return nil, fmt.Errorf("custom query exceeded %d pages", maxPages)
 		}
-
 		var response GenericEventResponse
-		err = json.Unmarshal(respBytes, &response)
-		if err != nil {
-			return GenericEventResponse{}, err
+		if err := getJSON(ctx, conf, db, url, &response); err != nil {
+			return nil, err
 		}
-
-		jresp, _ := json.MarshalIndent(response, "", "    ")
-		log.Debugf("Query result:\n%s", string(jresp))
-
-		return response, nil
-	} else {
-		return GenericEventResponse{}, generateError(resp)
+		all = append(all, response.Records...)
+		url = ""
+		if !response.Done && response.NextRecordsUrl != "" {
+			url = conf.Auth.TokenUrl + response.NextRecordsUrl
+		}
 	}
+	return all, nil
 }
 
-// Request Salesforce Org limits
-// Result: list of limits.
-func RequestLimits(conf *config.EventLogConfig, db cache.Cache) (map[string]SingleLimitResponse, error) {
+// RequestLimits returns Salesforce org limits.
+func RequestLimits(ctx context.Context, conf *config.EventLogConfig, db cache.Cache) (map[string]SingleLimitResponse, error) {
 	limitsConf := &conf.Limits
 	url := conf.Auth.TokenUrl + "/services/data/v" + limitsConf.ApiVer + "/limits"
 
-	resp, err := request(conf, db, url, false)
-	if err != nil {
+	var response map[string]SingleLimitResponse
+	if err := getJSON(ctx, conf, db, url, &response); err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		respBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		var response map[string]SingleLimitResponse
-		err = json.Unmarshal(respBytes, &response)
-		if err != nil {
-			return nil, err
-		}
-
-		jresp, _ := json.MarshalIndent(response, "", "    ")
-		log.Debugf("Query result:\n%s", string(jresp))
-
-		if len(limitsConf.Names) == 0 {
-			return response, nil
-		} else {
-			// Filter limits
-			filteredResponse := map[string]SingleLimitResponse{}
-			for _, limitName := range limitsConf.Names {
-				limit, limitExists := response[limitName]
-				if limitExists {
-					filteredResponse[limitName] = limit
-				}
-			}
-			return filteredResponse, nil
-		}
-	} else {
-		return nil, generateError(resp)
+	if len(limitsConf.Names) == 0 {
+		return response, nil
 	}
+	filtered := map[string]SingleLimitResponse{}
+	for _, limitName := range limitsConf.Names {
+		if limit, ok := response[limitName]; ok {
+			filtered[limitName] = limit
+		}
+	}
+	return filtered, nil
 }
 
-// Perform a generic request to Salesforce API.
-func request(conf *config.EventLogConfig, db cache.Cache, url string, isRetry bool) (*http.Response, error) {
+var httpClient = &http.Client{}
+
+// request performs an authenticated API GET using requestTimeout.
+func request(ctx context.Context, conf *config.EventLogConfig, db cache.Cache, url string, isRetry bool) (*http.Response, error) {
+	return requestWithTimeout(ctx, conf, db, url, time.Duration(conf.RequestTimeout)*time.Second, isRetry)
+}
+
+// requestWithTimeout performs an authenticated GET, re-authenticating once on 401.
+// A zero timeout relies on ctx only.
+func requestWithTimeout(ctx context.Context, conf *config.EventLogConfig, db cache.Cache, url string, timeout time.Duration, isRetry bool) (*http.Response, error) {
 	accessToken, err := auth(conf, db)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
+	reqCtx := ctx
+	var cancel context.CancelFunc = func() {}
+	if timeout > 0 {
+		reqCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
 
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	req.Header.Add("User-Agent", getUserAgent())
 	req.Header.Add("Authorization", "Bearer "+accessToken)
 
-	client := http.DefaultClient
-	client.Timeout = time.Duration(conf.RequestTimeout) * time.Second
-
-	resp, err := client.Do(req)
-
-	if err == nil {
-		if resp.StatusCode == 401 && !isRetry {
-			log.Warnf("Wrong credentials error (401). Try relogging...")
-			err := relogin(conf, db)
-			if err != nil {
-				return nil, err
-			}
-			// Retry request after relogin
-			return request(conf, db, url, true)
-		} else {
-			return resp, nil
-		}
-	} else {
+	// The upstream code mutated http.DefaultClient.Timeout on every request.
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		cancel()
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusUnauthorized && !isRetry {
+		resp.Body.Close()
+		cancel()
+		log.Warnf("Wrong credentials error (401). Try relogging...")
+		if err := relogin(conf, db); err != nil {
+			return nil, err
+		}
+		return requestWithTimeout(ctx, conf, db, url, timeout, true)
+	}
+	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 func getUserAgent() string {
-	return fmt.Sprintf(
-		"nr-salesforce-eventlog (%s; %s)",
-		runtime.GOOS,
-		runtime.GOARCH,
-	)
+	return fmt.Sprintf("%s/%s (%s; %s)", archive.CollectorName, archive.CollectorVersion, runtime.GOOS, runtime.GOARCH)
 }
 
-func csvFilePath(record *EventLogfileRecord) string {
-	return filepath.Join(os.TempDir(), record.Id+".csv")
+func sanitizeFileName(s string) string {
+	return filepath.Base(filepath.Clean("/" + s))
 }

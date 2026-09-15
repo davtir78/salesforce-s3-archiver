@@ -159,3 +159,14 @@ func (l *memoryLease) Release(ctx context.Context) error {
 	}
 	return nil
 }
+
+func (l *memoryLease) Clear(ctx context.Context) error {
+	b := l.store.backend
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !l.holds() {
+		return ErrLeaseLost
+	}
+	delete(b.checkpoints, l.key)
+	return nil
+}

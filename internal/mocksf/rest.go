@@ -22,6 +22,8 @@ type eventLogFile struct {
 	Interval    string
 	Sequence    int
 	csv         []byte
+	// logDateRaw overrides the LogDate value returned by queries (tests).
+	logDateRaw string
 }
 
 type queryCursor struct {
@@ -77,6 +79,21 @@ func (s *Server) AddEventLogFile(eventType string, created time.Time, rows int) 
 	return id
 }
 
+// AddEventLogFileRaw adds an EventLogFile with an arbitrary body (e.g. malformed
+// CSV). logDate overrides the LogDate string when non-empty. Rows are not
+// added to the ledger.
+func (s *Server) AddEventLogFileRaw(eventType string, created time.Time, body []byte, logDate string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := fmt.Sprintf("0AT%012d", len(s.elfs)+1)
+	s.elfs = append(s.elfs, &eventLogFile{
+		Id: id, EventType: eventType, CreatedDate: created.UTC(),
+		LogDate: created.UTC().Truncate(time.Hour), Interval: "Hourly", Sequence: 1,
+		csv: body, logDateRaw: logDate,
+	})
+	return id
+}
+
 // AddCustomRecords generates n rows for a custom query object.
 func (s *Server) AddCustomRecords(object string, created time.Time, n int) []string {
 	s.mu.Lock()
@@ -92,12 +109,21 @@ func (s *Server) AddCustomRecords(object string, created time.Time, n int) []str
 			"CreatedDate":    created.UTC().Format(sfDateFormat),
 			"SystemModstamp": created.UTC().Format(sfDateFormat),
 			"CreatedById":    s.opts.UserId,
+			// Larger than 2^53: must survive JSON decoding exactly.
+			"BigNumber": int64(9007199254740993) + int64(len(s.customLedger[object])),
 		}
 		s.custom[object] = append(s.custom[object], row)
 		s.customLedger[object] = append(s.customLedger[object], id)
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+func (f *eventLogFile) logDate() string {
+	if f.logDateRaw != "" {
+		return f.logDateRaw
+	}
+	return f.LogDate.Format(sfDateFormat)
 }
 
 func (s *Server) takeRestFault() bool {
@@ -205,7 +231,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, version str
 				"Id":            f.Id,
 				"EventType":     f.EventType,
 				"CreatedDate":   f.CreatedDate.Format(sfDateFormat),
-				"LogDate":       f.LogDate.Format(sfDateFormat),
+				"LogDate":       f.logDate(),
 				"Interval":      f.Interval,
 				"Sequence":      f.Sequence,
 				"LogFileLength": len(f.csv),

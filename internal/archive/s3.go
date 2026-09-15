@@ -27,6 +27,9 @@ type S3Options struct {
 	KmsKeyId       string
 	StorageClass   string
 	MaxAttempts    int
+	// Timeout for each upload attempt (data object or manifest). A hung
+	// connection otherwise blocks the collector indefinitely. Default 5m.
+	UploadTimeout time.Duration
 }
 
 // S3Sink uploads objects to Amazon S3 (or an S3-compatible endpoint).
@@ -42,6 +45,9 @@ func NewS3Sink(ctx context.Context, opts S3Options) (*S3Sink, error) {
 	}
 	if opts.MaxAttempts <= 0 {
 		opts.MaxAttempts = 5
+	}
+	if opts.UploadTimeout <= 0 {
+		opts.UploadTimeout = 5 * time.Minute
 	}
 	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRetryer(func() aws.Retryer {
@@ -125,6 +131,8 @@ func (s *S3Sink) put(ctx context.Context, key string, body io.Reader, contentTyp
 	if s.opts.StorageClass != "" {
 		input.StorageClass = types.StorageClass(s.opts.StorageClass)
 	}
+	ctx, cancel := context.WithTimeout(ctx, s.opts.UploadTimeout)
+	defer cancel()
 	_, err := s.uploader.Upload(ctx, input)
 	return err
 }

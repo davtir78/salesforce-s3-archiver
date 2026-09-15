@@ -524,8 +524,9 @@ func TestChaosNoLoss(t *testing.T) {
 		case 3:
 			h.mock.SetFaults(mocksf.Faults{DropStreamAfterEvents: rng.Intn(80) + 10})
 		case 4:
+			delay := time.Duration(rng.Intn(300)) * time.Millisecond
 			go func() {
-				time.Sleep(time.Duration(rng.Intn(300)) * time.Millisecond)
+				time.Sleep(delay)
 				h.mock.ExpireTokens()
 			}()
 		}
