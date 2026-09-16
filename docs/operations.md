@@ -16,6 +16,13 @@
 
 Both collectors serve Prometheus metrics on `metricsAddr` (`/metrics`, `/healthz`, `/readyz`).
 
+For the stream collector, `/readyz` means every topic has a session that has received data
+(events or a keepalive) and holds its lease. Readiness can lag a feed that stalls without
+closing by up to the 300-second idle timeout, which then ends the session. A healthy topic
+commits a checkpoint at least on every keepalive (about every 270 seconds), so to catch
+sustained problems alert when `sfarchive_stream_last_commit_timestamp_seconds` is more than
+about 10 minutes old.
+
 | Metric | Meaning | Suggested alert |
 |---|---|---|
 | `sfarchive_stream_last_committed_event_timestamp_seconds{topic}` | Event time covered by the checkpoint. `time() - value` is the replay age. | Warn well inside the Pub/Sub retention window (e.g. > 12h), page before it (e.g. > 24h). |
@@ -62,6 +69,19 @@ Another collector took over the topic, or Redis was unreachable for longer than 
 The collector stops without moving the checkpoint; the orchestrator restarts it. If it keeps
 happening, look for a second deployment or Redis instability.
 
+Checkpoint commits are retried for two thirds of the lease TTL (20 seconds at the default
+30-second TTL). A cache failover that takes longer, such as an ElastiCache primary replacement,
+stops every topic: the lease cannot be proven held, so continuing would risk two writers. This
+is deliberate. The restarted collectors resume from the last committed checkpoint and re-archive
+at most one batch per topic.
+
+### Stream collector stops with "authentication failed N times in a row"
+
+Five consecutive logins failed, or sessions were rejected before receiving any data, either at
+startup or after the credentials stopped working mid-run (revoked, rotated, or the integration
+user lost Pub/Sub access). Fix the credentials; the checkpoint is untouched, so the restarted
+collector resumes where it stopped.
+
 ### S3 unavailable
 
 Writes are retried (`maxAttempts`, `uploadTimeoutSeconds`), then the stream collector stops
@@ -87,3 +107,36 @@ Delete the query watermark key `<instanceName>_query_<hash>_last_run_ts` and set
 `sf-archive-verify -bucket <bucket> -prefix <prefix>` checks every manifest against its object
 (record count, size, SHA-256) and exits non-zero on mismatches or objects without manifests.
 With `-ledger` it also reconciles against the mock org's ledger.
+
+## Upgrading from earlier builds
+
+These changes affect a deployment that already has data in S3 or state in
+Redis. A new deployment can ignore this section.
+
+- **Record envelope (manifest version 2).** Every line is now an envelope with
+  the Salesforce record under `payload`. Objects written by earlier builds have
+  `manifestVersion: 1` and the old line format. Keep them under a separate
+  prefix (or delete them if they were test data) rather than mixing the two
+  formats under one Athena table.
+- **`eventLog.instanceName` is required.** Cache keys are namespaced by it, so a
+  config without one is rejected at startup. Set it to the name the instance
+  had before, or its watermarks will not be found.
+- **Custom query state is re-keyed.** De-duplication markers were keyed by
+  object (`<instanceName>_soql_<object>_…`) and are now keyed by a hash of the
+  query, so two queries on one object no longer share them. The watermark key
+  `<instanceName>_query_<hash>_last_run_ts` keeps its form, but the hash now
+  treats select fields as a set, so it changes too. On the first poll after
+  upgrading, each custom query starts from `initialTimeInterval` and rows in
+  that window are archived once more. The duplicates carry the same `event_id`,
+  so queries can de-duplicate on it; the new watermark key is shown in the
+  debug-level "Custom query on …" log line.
+- **`cache.redis.keyPrefix` now applies to every key.** It previously applied
+  only to stream checkpoints. If you set it, event log watermarks and markers
+  move under the prefix: rename the existing `<instanceName>_*` keys to
+  `<keyPrefix><instanceName>_*`, or expect a re-collection over
+  `initialTimeInterval`.
+- **Custom queries with `endTimestamp`** now select on the end field alone, so
+  records that started before the window and finished inside it are archived.
+- **403 responses no longer tombstone EventLogFiles.** Only 400, 404 and 410
+  count towards `unavailableFileAttempts`; 403 (including
+  `REQUEST_LIMIT_EXCEEDED`) keeps blocking until it clears.
