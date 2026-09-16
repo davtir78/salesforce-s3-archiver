@@ -22,7 +22,10 @@ const (
 	SourceSOQL     = "soql"
 	SourceLimits   = "limits"
 
-	ManifestVersion = 1
+	// ManifestVersion 2 introduced the record envelope (event_id, event_type,
+	// timestamp, source, env, org_id, instance, replay_id, payload). Version 1
+	// objects hold the earlier line format and are not readable as envelopes.
+	ManifestVersion = 2
 	CollectorName   = "salesforce-s3-archiver"
 )
 
@@ -31,18 +34,24 @@ var CollectorVersion = "dev"
 
 // Record is one archived event, log line or query row.
 type Record struct {
-	Type       string
-	Timestamp  time.Time
-	Attributes map[string]any
+	Type      string
+	Timestamp time.Time
+	// Id uniquely identifies this record within its source, for downstream
+	// de-duplication. Empty when the source has no usable identifier.
+	Id string
+	// Payload is the source record, unchanged.
+	Payload map[string]any
 	// Opaque Pub/Sub replay ID, streams only.
 	ReplayId []byte
 }
 
 // ObjectMeta describes the object being written.
 type ObjectMeta struct {
-	Source    string
-	OrgId     string
-	Instance  string
+	Source   string
+	OrgId    string
+	Instance string
+	// Env identifies the deployment that collected the data (e.g. "prod").
+	Env       string
 	EventType string
 	// Time used for the year/month/day/hour partition.
 	PartitionTime time.Time

@@ -190,6 +190,9 @@ type EventLogConfig struct {
 	// Polls a file may fail CSV parsing before its raw lines are archived to a
 	// quarantine object and processing moves past it (default 3).
 	MalformedFileAttempts int `mapstructure:"malformedFileAttempts"`
+	// Polls a file may fail to download with a permanent error (404, 400)
+	// before it is recorded as unavailable and skipped (default 5).
+	UnavailableFileAttempts int `mapstructure:"unavailableFileAttempts"`
 	// Records per archived object for custom queries (default 10000).
 	RecordsPerObject int `mapstructure:"recordsPerObject"`
 }
@@ -202,6 +205,9 @@ type Config struct {
 	Archive     ArchiveConfig      `mapstructure:"archive"`
 	// Organisation ID override; normally discovered from the userinfo endpoint.
 	OrgId string `mapstructure:"orgId"`
+	// Env identifies the deployment that collected the data (e.g. "prod",
+	// "test"). Stored in every archived line as env.
+	Env string `mapstructure:"env"`
 	// Address for the /metrics and /healthz HTTP server, e.g. ":9090". Empty disables it.
 	MetricsAddr string `mapstructure:"metricsAddr"`
 	LogLevel    string `mapstructure:"logLevel"`

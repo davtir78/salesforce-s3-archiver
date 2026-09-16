@@ -3,6 +3,7 @@ package mocksf
 import (
 	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -24,6 +25,8 @@ type eventLogFile struct {
 	csv         []byte
 	// logDateRaw overrides the LogDate value returned by queries (tests).
 	logDateRaw string
+	// deleted makes the download return 404 while the record is still listed.
+	deleted bool
 }
 
 type queryCursor struct {
@@ -119,6 +122,22 @@ func (s *Server) AddCustomRecords(object string, created time.Time, n int) []str
 	return ids
 }
 
+// SetCustomField sets field to value on existing custom rows, e.g. an end
+// timestamp that differs from CreatedDate.
+func (s *Server) SetCustomField(object string, ids []string, field string, value time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	for _, row := range s.custom[object] {
+		if want[row["Id"].(string)] {
+			row[field] = value.UTC().Format(sfDateFormat)
+		}
+	}
+}
+
 func (f *eventLogFile) logDate() string {
 	if f.logDateRaw != "" {
 		return f.logDateRaw
@@ -187,29 +206,40 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, version str
 		writeJSON(w, http.StatusBadRequest, []map[string]string{{"errorCode": "MALFORMED_QUERY", "message": "missing FROM"}})
 		return
 	}
-	var since, until *time.Time
-	var field string
-	if m := reGTE.FindStringSubmatch(q); m != nil {
-		t, err := parseSFTime(m[2])
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, []map[string]string{{"errorCode": "MALFORMED_QUERY", "message": err.Error()}})
-			return
-		}
-		since, field = &t, m[1]
+	// Apply every "Field >= t" and "Field <= t" clause, as Salesforce would.
+	// Honouring only the first one hid queries that bound a different field.
+	type bound struct {
+		field string
+		t     time.Time
+		lower bool
 	}
-	if m := reLTE.FindStringSubmatch(q); m != nil {
-		t, err := parseSFTime(m[2])
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, []map[string]string{{"errorCode": "MALFORMED_QUERY", "message": err.Error()}})
-			return
-		}
-		until = &t
-		if field == "" {
-			field = m[1]
+	var bounds []bound
+	for _, spec := range []struct {
+		re    *regexp.Regexp
+		lower bool
+	}{{reGTE, true}, {reLTE, false}} {
+		for _, m := range spec.re.FindAllStringSubmatch(q, -1) {
+			t, err := parseSFTime(m[2])
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, []map[string]string{{"errorCode": "MALFORMED_QUERY", "message": err.Error()}})
+				return
+			}
+			bounds = append(bounds, bound{m[1], t, spec.lower})
 		}
 	}
-	inRange := func(t time.Time) bool {
-		return (since == nil || !t.Before(*since)) && (until == nil || !t.After(*until))
+	// inRange checks the bounds on field, using value(field) for each bound's field.
+	inRange := func(value func(field string) (time.Time, bool)) bool {
+		for _, b := range bounds {
+			t, ok := value(b.field)
+			if !ok {
+				// SOQL range comparisons never match a null field.
+				return false
+			}
+			if (b.lower && t.Before(b.t)) || (!b.lower && t.After(b.t)) {
+				return false
+			}
+		}
+		return true
 	}
 
 	var records []map[string]any
@@ -223,31 +253,34 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, version str
 			if len(types) > 0 && !types[f.EventType] {
 				continue
 			}
-			if !inRange(f.CreatedDate) {
+			created := f.CreatedDate
+			if !inRange(func(string) (time.Time, bool) { return created, true }) {
 				continue
 			}
 			records = append(records, map[string]any{
-				"attributes":    map[string]any{"type": "EventLogFile", "url": "/services/data/" + version + "/sobjects/EventLogFile/" + f.Id},
-				"Id":            f.Id,
-				"EventType":     f.EventType,
-				"CreatedDate":   f.CreatedDate.Format(sfDateFormat),
-				"LogDate":       f.logDate(),
-				"Interval":      f.Interval,
-				"Sequence":      f.Sequence,
-				"LogFileLength": len(f.csv),
+				"attributes":  map[string]any{"type": "EventLogFile", "url": "/services/data/" + version + "/sobjects/EventLogFile/" + f.Id},
+				"Id":          f.Id,
+				"EventType":   f.EventType,
+				"CreatedDate": f.CreatedDate.Format(sfDateFormat),
+				"LogDate":     f.logDate(),
+				"Interval":    f.Interval,
+				"Sequence":    f.Sequence,
+				// Salesforce types this as a double: the JSON is e.g. 2692.0.
+				"LogFileLength": json.Number(fmt.Sprintf("%d.0", len(f.csv))),
 				"LogFile":       "/services/data/" + version + "/sobjects/EventLogFile/" + f.Id + "/LogFile",
 			})
 		}
 	} else {
 		for _, row := range s.custom[from[1]] {
-			ts := row["CreatedDate"].(string)
-			if field != "" {
-				if v, ok := row[field].(string); ok {
-					ts = v
+			fieldTime := func(field string) (time.Time, bool) {
+				v, ok := row[field].(string)
+				if !ok || v == "" {
+					return time.Time{}, false
 				}
+				t, err := parseSFTime(v)
+				return t, err == nil
 			}
-			t, _ := parseSFTime(ts)
-			if !inRange(t) {
+			if !inRange(fieldTime) {
 				continue
 			}
 			records = append(records, filterFields(row, q))
@@ -289,6 +322,11 @@ func (s *Server) respondPage(w http.ResponseWriter, records []map[string]any, of
 		"done":      end >= len(records),
 		"records":   records[offset:end],
 	}
+	if s.opts.TruncateQueryResults {
+		resp["done"] = false
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	if records == nil {
 		resp["records"] = []any{}
 	}
@@ -327,7 +365,7 @@ func (s *Server) handleLogFile(w http.ResponseWriter, id string) {
 		s.faults.TruncateNextDownload = 0
 	}
 	s.mu.Unlock()
-	if file == nil {
+	if file == nil || file.deleted {
 		writeJSON(w, http.StatusNotFound, []map[string]string{{"errorCode": "NOT_FOUND", "message": "not found"}})
 		return
 	}
@@ -347,4 +385,17 @@ func (s *Server) handleLogFile(w http.ResponseWriter, id string) {
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Write(body)
+}
+
+// DeleteEventLogFileBody makes downloads of one EventLogFile return 404 while
+// the record still appears in query results, as happens when a file expires.
+func (s *Server) DeleteEventLogFileBody(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.elfs {
+		if f.Id == id {
+			f.csv = nil
+			f.deleted = true
+		}
+	}
 }

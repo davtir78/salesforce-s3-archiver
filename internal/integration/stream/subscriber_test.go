@@ -120,7 +120,7 @@ func (h *harness) archived() map[string]int {
 	}
 	counts := map[string]int{}
 	for _, l := range lines {
-		id, _ := l.Attributes["EventIdentifier"].(string)
+		id, _ := l.Payload["EventIdentifier"].(string)
 		counts[id]++
 	}
 	return counts
@@ -217,8 +217,8 @@ func TestArchivesEveryEventAndCommitsAfterDurability(t *testing.T) {
 	lines, _ := h.sink.Lines()
 	l := lines[0]
 	for _, field := range []string{"EventUuid", "CreatedDate", "CreatedById", "EventIdentifier", "SourceIp", "Score", "IsSuccess"} {
-		if _, ok := l.Attributes[field]; !ok {
-			t.Errorf("field %s missing from archived event: %v", field, l.Attributes)
+		if _, ok := l.Payload[field]; !ok {
+			t.Errorf("field %s missing from archived event: %v", field, l.Payload)
 		}
 	}
 	if l.EventType != "LoginEventStream" || l.OrgId != h.mock.Options().OrgId || l.ReplayId == "" {
@@ -705,5 +705,25 @@ func TestShutdownDuringKeepaliveCommitIsClean(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("subscriber did not stop")
+	}
+}
+
+// event_id prefers EventUuid (every Real-Time Event Monitoring event) and falls
+// back to EventIdentifier for older topics.
+func TestStreamEventId(t *testing.T) {
+	cases := []struct {
+		fields map[string]any
+		want   string
+	}{
+		{map[string]any{"EventUuid": "uuid-1", "EventIdentifier": "ident-1"}, "uuid-1"},
+		{map[string]any{"EventIdentifier": "ident-2"}, "ident-2"},
+		{map[string]any{"EventUuid": "", "EventIdentifier": "ident-3"}, "ident-3"},
+		{map[string]any{"EventUuid": 42}, ""},
+		{map[string]any{}, ""},
+	}
+	for _, c := range cases {
+		if got := streamEventId(c.fields); got != c.want {
+			t.Errorf("streamEventId(%v) = %q, want %q", c.fields, got, c.want)
+		}
 	}
 }

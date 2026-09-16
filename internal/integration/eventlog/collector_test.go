@@ -52,7 +52,7 @@ func newELFHarness(t *testing.T, opts mocksf.Options) *elfHarness {
 	}
 	db := cache.NewMemoryCache()
 	sink := archive.NewMemorySink()
-	c := NewCollector(conf, o.OrgId, db, sink)
+	c := NewCollector(conf, o.OrgId, "test-env", db, sink)
 	c.DownloadDir = t.TempDir()
 	return &elfHarness{t: t, mock: mock, conf: conf, db: db, sink: sink, c: c, dlDir: c.DownloadDir}
 }
@@ -65,7 +65,7 @@ func (h *elfHarness) archivedRequestIds() map[string]int {
 	counts := map[string]int{}
 	for _, l := range lines {
 		if l.Source == archive.SourceEventLog {
-			id, _ := l.Attributes["REQUEST_ID"].(string)
+			id, _ := l.Payload["REQUEST_ID"].(string)
 			counts[id]++
 		}
 	}
@@ -118,10 +118,10 @@ func TestArchivesEventLogFilesAcrossPages(t *testing.T) {
 		}
 	}
 	lines, _ := h.sink.Lines()
-	if v := lines[0].Attributes["LOGIN_TYPE"]; v != `Application, with "quotes"` {
+	if v := lines[0].Payload["LOGIN_TYPE"]; v != `Application, with "quotes"` {
 		t.Errorf("CSV quoting not preserved: %q", v)
 	}
-	if _, ok := lines[0].Attributes["RUN_TIME"].(string); !ok {
+	if _, ok := lines[0].Payload["RUN_TIME"].(string); !ok {
 		t.Errorf("values must be kept as original strings")
 	}
 	h.assertNoTempFiles()
@@ -223,7 +223,7 @@ func TestCsvFilesAreClosed(t *testing.T) {
 	// streamCsv closes the file even when the writer fails mid-file.
 	path := filepath.Join(t.TempDir(), "x.csv")
 	os.WriteFile(path, []byte("EVENT_TYPE,REQUEST_ID\nLogin,a\nLogin,b\n"), 0o600)
-	err := streamCsv(path, "Login", nil, failingWriter{})
+	err := streamCsv(path, "0AT1", "Login", nil, failingWriter{})
 	if err == nil {
 		t.Fatal("expected writer error")
 	}
@@ -250,7 +250,7 @@ func openFileCount() int {
 func TestMalformedCsvFailsTheFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.csv")
 	os.WriteFile(path, []byte("EVENT_TYPE,REQUEST_ID\nLogin,a,extra\n"), 0o600)
-	if err := streamCsv(path, "Login", nil, recordCollector(func(archive.Record) {})); err == nil {
+	if err := streamCsv(path, "0AT1", "Login", nil, recordCollector(func(archive.Record) {})); err == nil {
 		t.Errorf("rows with the wrong field count must fail rather than be skipped")
 	}
 }
@@ -274,7 +274,7 @@ func TestCustomQueriesPaginateDedupeAndRetry(t *testing.T) {
 		lines, _ := h.sink.Lines()
 		m := map[string]int{}
 		for _, l := range lines {
-			id, _ := l.Attributes["Id"].(string)
+			id, _ := l.Payload["Id"].(string)
 			m[id]++
 		}
 		return m, len(lines)
@@ -314,7 +314,7 @@ func TestCustomQueriesPaginateDedupeAndRetry(t *testing.T) {
 		t.Errorf("expected 16 unique rows after recovery, got %d unique / %d lines", len(ids), total)
 	}
 	lines, _ := h.sink.Lines()
-	if _, ok := lines[0].Attributes["attributes"]; ok {
+	if _, ok := lines[0].Payload["attributes"]; ok {
 		t.Errorf("salesforce 'attributes' metadata should be removed")
 	}
 }
@@ -328,7 +328,7 @@ func TestLimitsArchived(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines, _ := h.sink.Lines()
-	if len(lines) != 1 || lines[0].Source != archive.SourceLimits || lines[0].Attributes["limitName"] != "DailyApiRequests" {
+	if len(lines) != 1 || lines[0].Source != archive.SourceLimits || lines[0].Payload["limitName"] != "DailyApiRequests" {
 		t.Errorf("unexpected limits output: %+v", lines)
 	}
 }
@@ -338,7 +338,7 @@ func TestBuildCsvRecordFromSample(t *testing.T) {
 	path := filepath.Join(filepath.Dir(filename), "testdata", "login_logs_sample.csv")
 	var records []archive.Record
 	w := recordCollector(func(r archive.Record) { records = append(records, r) })
-	if err := streamCsv(path, "Login", nil, w); err != nil {
+	if err := streamCsv(path, "0AT1", "Login", nil, w); err != nil {
 		t.Fatal(err)
 	}
 	if len(records) != 9 {
@@ -349,17 +349,17 @@ func TestBuildCsvRecordFromSample(t *testing.T) {
 	if !r.Timestamp.Equal(want) || r.Type != "Login" {
 		t.Errorf("timestamp/type = %v %s", r.Timestamp, r.Type)
 	}
-	if r.Attributes["URI"] != "/services/oauth2/token" || r.Attributes["RUN_TIME"] != "157" || len(r.Attributes) != 34 {
-		t.Errorf("unexpected attributes (%d): %v", len(r.Attributes), r.Attributes)
+	if r.Payload["URI"] != "/services/oauth2/token" || r.Payload["RUN_TIME"] != "157" || len(r.Payload) != 34 {
+		t.Errorf("unexpected attributes (%d): %v", len(r.Payload), r.Payload)
 	}
 
 	// Field mapping keeps mapped fields plus identifying columns.
 	records = nil
-	if err := streamCsv(path, "Login", FieldMapping{"URI": true}, w); err != nil {
+	if err := streamCsv(path, "0AT1", "Login", FieldMapping{"URI": true}, w); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(records[0].Attributes); got != 4 {
-		t.Errorf("mapped record should have URI, EVENT_TYPE, TIMESTAMP, REQUEST_ID; got %v", records[0].Attributes)
+	if got := len(records[0].Payload); got != 4 {
+		t.Errorf("mapped record should have URI, EVENT_TYPE, TIMESTAMP, REQUEST_ID; got %v", records[0].Payload)
 	}
 }
 
@@ -466,7 +466,234 @@ func TestSoqlLargeNumbersAreExact(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("expected one row, got %d", len(lines))
 	}
-	if got := fmt.Sprint(lines[0].Attributes["BigNumber"]); got != "9007199254740993" {
+	if got := fmt.Sprint(lines[0].Payload["BigNumber"]); got != "9007199254740993" {
 		t.Errorf("BigNumber = %s, want 9007199254740993 (float64 would round it)", got)
+	}
+}
+
+// Two queries on the same object must not share de-duplication markers.
+func TestDedupKeysAreScopedPerQuery(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.SkipLogFiles = true
+	qA := config.QueryConfig{
+		Soql:   config.SoqlConfig{Select: []string{"Id", "Action", "CreatedDate"}, From: "SetupAuditTrail"},
+		ApiVer: "64.0", ApiName: "rest", Timestamp: "CreatedDate",
+	}
+	qB := config.QueryConfig{
+		Soql:   config.SoqlConfig{Select: []string{"Id", "Section", "CreatedDate"}, From: "SetupAuditTrail"},
+		ApiVer: "64.0", ApiName: "rest", Timestamp: "CreatedDate",
+	}
+	h.conf.CustomQueries = []config.QueryConfig{qA, qB}
+	h.mock.AddCustomRecords("SetupAuditTrail", time.Now().Add(-5*time.Minute), 4)
+
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lines, _ := h.sink.Lines()
+	if len(lines) != 8 {
+		t.Fatalf("each query must archive all 4 rows (8 lines), got %d", len(lines))
+	}
+	withAction, withSection := 0, 0
+	for _, l := range lines {
+		if _, ok := l.Payload["Action"]; ok {
+			withAction++
+		}
+		if _, ok := l.Payload["Section"]; ok {
+			withSection++
+		}
+	}
+	if withAction != 4 || withSection != 4 {
+		t.Errorf("expected 4 rows per query, got action=%d section=%d", withAction, withSection)
+	}
+}
+
+// A truncated result set must fail instead of advancing the watermark.
+func TestIncompleteResultSetFailsPoll(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{TruncateQueryResults: true})
+	h.conf.SkipLogFiles = true
+	h.conf.CustomQueries = []config.QueryConfig{{
+		Soql:   config.SoqlConfig{Select: []string{"Id", "CreatedDate"}, From: "SetupAuditTrail"},
+		ApiVer: "64.0", ApiName: "rest", Timestamp: "CreatedDate",
+	}}
+	h.mock.AddCustomRecords("SetupAuditTrail", time.Now().Add(-5*time.Minute), 10)
+	key := h.c.queryWatermarkKey(&h.conf.CustomQueries[0])
+
+	err := h.c.Poll(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "incomplete result set") {
+		t.Fatalf("expected an incomplete result set error, got %v", err)
+	}
+	if _, ok, _ := h.c.watermark(key); ok {
+		t.Errorf("watermark must not advance when results were truncated")
+	}
+}
+
+func TestBuildCustomIdCannotCollide(t *testing.T) {
+	q := &config.QueryConfig{CustomId: []string{"a", "b"}, Soql: config.SoqlConfig{From: "T"}}
+	first := buildCustomId(map[string]any{"a": "ab", "b": "c"}, q)
+	second := buildCustomId(map[string]any{"a": "a", "b": "bc"}, q)
+	if first == "" || second == "" {
+		t.Fatal("custom ids should be produced")
+	}
+	if first == second {
+		t.Errorf("field values must be delimited: %q collides", first)
+	}
+}
+
+// A file Salesforce permanently refuses (404) must not block newer files forever.
+func TestPermanentlyUnavailableFileIsSkipped(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.UnavailableFileAttempts = 3
+	base := time.Now().Add(-20 * time.Minute)
+	h.mock.AddEventLogFile("Login", base, 5)
+	gone := h.mock.AddEventLogFile("Login", base.Add(time.Minute), 5)
+	h.mock.AddEventLogFile("Login", base.Add(2*time.Minute), 5)
+	h.mock.DeleteEventLogFileBody(gone) // downloads now 404
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := h.c.Poll(context.Background()); err == nil {
+			t.Fatalf("attempt %d: expected the download failure to block", attempt)
+		}
+		if n := len(h.sink.Keys()); n != 1 {
+			t.Fatalf("attempt %d: expected only the first file archived, got %d", attempt, n)
+		}
+	}
+
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatalf("third poll should record the file as unavailable: %v", err)
+	}
+	var tombstone string
+	for _, k := range h.sink.Keys() {
+		if strings.Contains(k, "elf-"+gone+"-unavailable") {
+			tombstone = k
+		}
+	}
+	if tombstone == "" {
+		t.Fatalf("no tombstone object in %v", h.sink.Keys())
+	}
+	m, _ := h.sink.Manifest(tombstone)
+	if m.Lineage["unavailableReason"] == "" {
+		t.Errorf("tombstone manifest should record the reason: %+v", m.Lineage)
+	}
+	if n := len(h.sink.Keys()); n != 3 {
+		t.Errorf("expected first file, tombstone and third file, got %d objects", n)
+	}
+}
+
+// A transient failure must keep blocking: skipping would lose retrievable data.
+func TestTransientDownloadFailureKeepsBlocking(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.UnavailableFileAttempts = 2
+	h.mock.AddEventLogFile("Login", time.Now().Add(-5*time.Minute), 5)
+	for attempt := 1; attempt <= 3; attempt++ {
+		h.mock.SetFaults(mocksf.Faults{FailRestRequests: 2}) // 500s
+		if err := h.c.Poll(context.Background()); err == nil {
+			t.Fatalf("attempt %d: a 5xx must not be treated as permanent", attempt)
+		}
+	}
+	h.mock.SetFaults(mocksf.Faults{})
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h.missingRows() != 0 {
+		t.Errorf("rows lost after transient failures")
+	}
+	for _, k := range h.sink.Keys() {
+		if strings.Contains(k, "unavailable") {
+			t.Errorf("transient failure must not produce a tombstone: %s", k)
+		}
+	}
+}
+
+// With endTimestamp, a record that started before the window but finished
+// inside it must be archived; one still running must wait until it finishes.
+func TestEndTimestampSelectsRecordsFinishingInWindow(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.SkipLogFiles = true
+	h.conf.CustomQueries = []config.QueryConfig{{
+		Soql:         config.SoqlConfig{Select: []string{"Id", "CreatedDate", "CompletedDate"}, From: "SetupAuditTrail"},
+		ApiVer:       "64.0",
+		ApiName:      "rest",
+		Timestamp:    "CreatedDate",
+		EndTimestamp: "CompletedDate",
+	}}
+	// The initial window is 2h; these started 5h ago.
+	started := time.Now().Add(-5 * time.Hour)
+	finished := h.mock.AddCustomRecords("SetupAuditTrail", started, 3)
+	h.mock.SetCustomField("SetupAuditTrail", finished, "CompletedDate", time.Now().Add(-10*time.Minute))
+	running := h.mock.AddCustomRecords("SetupAuditTrail", started, 2)
+
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	archived := func() map[string]int {
+		lines, _ := h.sink.Lines()
+		m := map[string]int{}
+		for _, l := range lines {
+			id, _ := l.Payload["Id"].(string)
+			m[id]++
+		}
+		return m
+	}
+	got := archived()
+	for _, id := range finished {
+		if got[id] != 1 {
+			t.Errorf("record %s started before the window and finished inside it: archived %d times, want 1", id, got[id])
+		}
+	}
+	for _, id := range running {
+		if got[id] != 0 {
+			t.Errorf("record %s has not finished and must not be archived yet", id)
+		}
+	}
+
+	// Once the running records finish they are archived, exactly once.
+	h.mock.SetCustomField("SetupAuditTrail", running, "CompletedDate", time.Now().Add(-time.Second))
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got = archived()
+	for _, id := range append(finished, running...) {
+		if got[id] != 1 {
+			t.Errorf("record %s archived %d times after it finished, want 1", id, got[id])
+		}
+	}
+}
+
+// Reordering the select list must not reset a query's watermark and markers.
+func TestQueryHashIgnoresSelectOrder(t *testing.T) {
+	a := &config.QueryConfig{Soql: config.SoqlConfig{From: "T", Select: []string{"Id", "Action", "CreatedDate"}}, Timestamp: "CreatedDate"}
+	b := &config.QueryConfig{Soql: config.SoqlConfig{From: "T", Select: []string{"CreatedDate", " id", "Action"}}, Timestamp: "CreatedDate"}
+	if queryHash(a) != queryHash(b) {
+		t.Errorf("select order changed the query hash")
+	}
+	c := &config.QueryConfig{Soql: config.SoqlConfig{From: "T", Select: []string{"Id", "Section", "CreatedDate"}}, Timestamp: "CreatedDate"}
+	if queryHash(a) == queryHash(c) {
+		t.Errorf("different select lists must hash differently")
+	}
+}
+
+// Each archived version of a row needs its own event_id, or de-duplicating on
+// event_id downstream would drop later versions of a changed record.
+func TestCustomEventIdDistinguishesVersions(t *testing.T) {
+	q := &config.QueryConfig{Soql: config.SoqlConfig{From: "Account"}, Timestamp: "LastModifiedDate"}
+	v1 := customEventId(map[string]any{"Id": "001A", "LastModifiedDate": "2026-09-15T10:00:00.000+0000"}, q)
+	v2 := customEventId(map[string]any{"Id": "001A", "LastModifiedDate": "2026-09-15T11:00:00.000+0000"}, q)
+	if v1 == v2 {
+		t.Errorf("two versions of a record share event_id %q", v1)
+	}
+	if again := customEventId(map[string]any{"Id": "001A", "LastModifiedDate": "2026-09-15T10:00:00.000+0000"}, q); again != v1 {
+		t.Errorf("the same version must keep its event_id: %q != %q", again, v1)
+	}
+	if !strings.HasPrefix(v1, "001A@") {
+		t.Errorf("event_id %q should start with the record Id", v1)
+	}
+	end := &config.QueryConfig{Soql: config.SoqlConfig{From: "Job"}, Timestamp: "CreatedDate", EndTimestamp: "CompletedDate"}
+	a := customEventId(map[string]any{"Id": "707A", "CreatedDate": "t0", "CompletedDate": "t1"}, end)
+	b := customEventId(map[string]any{"Id": "707A", "CreatedDate": "t0", "CompletedDate": "t2"}, end)
+	if a == b {
+		t.Errorf("endTimestamp must be part of event_id: %q", a)
+	}
+	if id := customEventId(map[string]any{"Name": "x"}, q); id != "" {
+		t.Errorf("a row with no Id or custom ID has no event_id, got %q", id)
 	}
 }

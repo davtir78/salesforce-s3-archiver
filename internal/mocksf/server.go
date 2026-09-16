@@ -49,6 +49,9 @@ type Options struct {
 	EventLogRows int
 	// Objects that custom SOQL queries may target.
 	CustomObjects []string
+	// TruncateQueryResults returns the first page with done=false and no
+	// nextRecordsUrl, as Salesforce does for a query with a LIMIT.
+	TruncateQueryResults bool
 }
 
 func (o *Options) defaults() {
