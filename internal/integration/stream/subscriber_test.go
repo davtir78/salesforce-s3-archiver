@@ -786,3 +786,23 @@ func TestRepeatedAuthFailuresAreFatal(t *testing.T) {
 		t.Errorf("must not report ready while authentication is failing")
 	}
 }
+
+// event_id prefers EventUuid (every Real-Time Event Monitoring event) and falls
+// back to EventIdentifier for older topics.
+func TestStreamEventId(t *testing.T) {
+	cases := []struct {
+		fields map[string]any
+		want   string
+	}{
+		{map[string]any{"EventUuid": "uuid-1", "EventIdentifier": "ident-1"}, "uuid-1"},
+		{map[string]any{"EventIdentifier": "ident-2"}, "ident-2"},
+		{map[string]any{"EventUuid": "", "EventIdentifier": "ident-3"}, "ident-3"},
+		{map[string]any{"EventUuid": 42}, ""},
+		{map[string]any{}, ""},
+	}
+	for _, c := range cases {
+		if got := streamEventId(c.fields); got != c.want {
+			t.Errorf("streamEventId(%v) = %q, want %q", c.fields, got, c.want)
+		}
+	}
+}

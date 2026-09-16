@@ -136,7 +136,7 @@ func (c *Collector) unavailableAttempts() int {
 // handleDownloadFailure decides whether a file that cannot be downloaded should
 // keep blocking newer files. Transient failures (5xx, timeouts, S3 problems)
 // always block, because skipping them would lose data that is still available.
-// A permanently rejected file (404, 400) is recorded as unavailable after
+// A permanently rejected file (400, 404, 410) is recorded as unavailable after
 // several polls so the watermark can move past it; the gap is archived as a
 // tombstone object and reported loudly.
 func (c *Collector) handleDownloadFailure(ctx context.Context, rec *query.EventLogfileRecord, created time.Time, cause error) error {

@@ -22,7 +22,10 @@ const (
 	SourceSOQL     = "soql"
 	SourceLimits   = "limits"
 
-	ManifestVersion = 1
+	// ManifestVersion 2 introduced the record envelope (event_id, event_type,
+	// timestamp, source, env, org_id, instance, replay_id, payload). Version 1
+	// objects hold the earlier line format and are not readable as envelopes.
+	ManifestVersion = 2
 	CollectorName   = "salesforce-s3-archiver"
 )
 
