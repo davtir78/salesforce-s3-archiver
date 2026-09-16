@@ -54,7 +54,12 @@ json_args() {
 
 OVERRIDES=$(mktemp)
 trap 'rm -f "$OVERRIDES"' EXIT
-OVERRIDE_ARGS=(--overrides "file://$OVERRIDES")
+# On Windows (Git Bash) the AWS CLI cannot open /tmp paths; give it a native one.
+OVERRIDES_PATH=$OVERRIDES
+if command -v cygpath >/dev/null 2>&1; then
+  OVERRIDES_PATH=$(cygpath -m "$OVERRIDES")
+fi
+OVERRIDE_ARGS=(--overrides "file://$OVERRIDES_PATH")
 
 if [ "$WHICH" = "verify" ]; then
   FAMILY=$($TF output -raw verify_task_definition)
