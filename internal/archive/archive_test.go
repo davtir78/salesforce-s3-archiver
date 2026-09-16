@@ -26,9 +26,11 @@ func TestObjectPaths(t *testing.T) {
 		PartitionTime: time.Date(2026, 9, 11, 9, 30, 0, 0, time.FixedZone("AEST", 10*3600)),
 	}
 	data, manifest := ObjectPaths(meta, "abc")
-	wantData := "raw/source=stream/org_id=00D000000000001/event_type=_event_Login_Event/year=2026/month=09/day=10/hour=23/abc.json.gz"
-	if data != wantData {
-		t.Errorf("data key = %s, want %s", data, wantData)
+	// Unsafe characters are replaced and a short hash of the original is
+	// appended, so different values cannot share a partition.
+	wantPrefix := "raw/source=stream/org_id=00D000000000001/event_type=_event_Login_Event-"
+	if !strings.HasPrefix(data, wantPrefix) || !strings.HasSuffix(data, "/year=2026/month=09/day=10/hour=23/abc.json.gz") {
+		t.Errorf("unexpected data key %s", data)
 	}
 	if !strings.HasPrefix(manifest, "manifests/source=stream/") || !strings.HasSuffix(manifest, "/abc.manifest.json") {
 		t.Errorf("unexpected manifest key %s", manifest)
@@ -231,5 +233,36 @@ func TestLineEnvelope(t *testing.T) {
 	}
 	if len(got) != len(want)+1 {
 		t.Errorf("unexpected envelope fields: %v", got)
+	}
+}
+
+func TestSanitisingDoesNotMergeValues(t *testing.T) {
+	seen := map[string]string{}
+	for _, eventType := range []string{"Login Event", "Login/Event", "Login_Event", "Login+Event"} {
+		meta := ObjectMeta{Source: SourceStream, OrgId: "org", EventType: eventType,
+			PartitionTime: time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)}
+		key, _ := ObjectPaths(meta, "obj")
+		if other, clash := seen[key]; clash {
+			t.Errorf("%q and %q map to the same key %s", other, eventType, key)
+		}
+		seen[key] = eventType
+	}
+}
+
+func TestZeroTimestampsAreNotCounted(t *testing.T) {
+	sink := NewMemorySink()
+	valid := time.Date(2026, 9, 15, 1, 0, 0, 0, time.UTC)
+	m, err := WriteRecords(context.Background(), sink, ObjectMeta{Source: SourceSOQL, OrgId: "org"}, []Record{
+		{Type: "T", Timestamp: time.Time{}, Payload: map[string]any{"a": 1}},
+		{Type: "T", Timestamp: valid, Payload: map[string]any{"a": 2}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.RecordCount != 2 {
+		t.Errorf("both records should be archived, got %d", m.RecordCount)
+	}
+	if m.FirstTimestamp == nil || !m.FirstTimestamp.Equal(valid) || !m.LastTimestamp.Equal(valid) {
+		t.Errorf("zero timestamps must not widen the manifest range: %v..%v", m.FirstTimestamp, m.LastTimestamp)
 	}
 }

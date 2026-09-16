@@ -4,6 +4,8 @@ package metrics
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -105,9 +107,11 @@ func IsReady() bool { return ready.Load() }
 func SetReady(v bool) { ready.Store(v) }
 
 // Serve runs the metrics/health server until ctx is done. addr "" disables it.
-func Serve(ctx context.Context, addr string) {
+// It returns an error if the address cannot be bound, so a collector does not
+// run silently without metrics or health endpoints.
+func Serve(ctx context.Context, addr string) error {
 	if addr == "" {
-		return
+		return nil
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
@@ -119,7 +123,11 @@ func Serve(ctx context.Context, addr string) {
 		}
 		w.Write([]byte("ready"))
 	})
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("metrics server cannot listen on %s: %w", addr, err)
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -127,8 +135,9 @@ func Serve(ctx context.Context, addr string) {
 		srv.Shutdown(shutdownCtx)
 	}()
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Errorf("metrics server: %v", err)
 		}
 	}()
+	return nil
 }
