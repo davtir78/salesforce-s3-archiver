@@ -13,6 +13,9 @@ import (
 
 var validEventType = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
+// limitOrOffset matches LIMIT or OFFSET as a SOQL keyword, however it is spaced.
+var limitOrOffset = regexp.MustCompile(`(?i)\b(LIMIT|OFFSET)\b`)
+
 // selectsField reports whether a SOQL select list contains field.
 func selectsField(selected []string, field string) bool {
 	for _, s := range selected {
@@ -92,7 +95,7 @@ func IntegrityCheck(conf *config.Config) error {
 		if customQuery.EndTimestamp != "" && !selectsField(customQuery.Soql.Select, customQuery.EndTimestamp) {
 			return fmt.Errorf("Custom query on '%s' must select its endTimestamp field '%s'", customQuery.Soql.From, customQuery.EndTimestamp)
 		}
-		if tail := strings.ToUpper(customQuery.Soql.Tail); strings.Contains(tail, "LIMIT ") || strings.Contains(tail, "OFFSET ") {
+		if limitOrOffset.MatchString(customQuery.Soql.Tail) {
 			return fmt.Errorf("Custom query on '%s' must not use LIMIT or OFFSET in 'tail': a truncated result set would move the watermark past rows that were never read", customQuery.Soql.From)
 		}
 	}

@@ -55,3 +55,19 @@ func TestQueryURLEncodesSpecialCharacters(t *testing.T) {
 		t.Errorf("a literal + must be percent-encoded, got %q", u.RawQuery)
 	}
 }
+
+// Only statuses that can never succeed may be permanent: a permanent error
+// lets a file be tombstoned and skipped.
+func TestHTTPErrorPermanent(t *testing.T) {
+	cases := map[int]bool{
+		400: true, 404: true, 410: true,
+		401: false, // re-login
+		403: false, // REQUEST_LIMIT_EXCEEDED resets; permissions can be fixed
+		408: false, 429: false, 500: false, 502: false, 503: false,
+	}
+	for code, want := range cases {
+		if got := (&HTTPError{StatusCode: code}).Permanent(); got != want {
+			t.Errorf("status %d: Permanent() = %v, want %v", code, got, want)
+		}
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -356,10 +357,16 @@ func csvRowId(fileId string, line int) string {
 
 // queryHash identifies one configured query. Two queries on the same object
 // must not share watermarks or de-duplication markers, otherwise one query
-// marks rows the other never archived.
+// marks rows the other never archived. Select fields are compared as a set, so
+// reordering them in the config does not reset the query's state.
 func queryHash(q *config.QueryConfig) string {
+	fields := make([]string, len(q.Soql.Select))
+	for i, s := range q.Soql.Select {
+		fields[i] = strings.ToLower(strings.TrimSpace(s))
+	}
+	sort.Strings(fields)
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%v|%s|%s|%s|%s|%s", q.Soql.From, q.Soql.Select, q.Soql.Where, q.Soql.Tail, q.Timestamp, q.EndTimestamp, q.ApiName)
+	fmt.Fprintf(h, "%s|%q|%s|%s|%s|%s|%s", q.Soql.From, fields, q.Soql.Where, q.Soql.Tail, q.Timestamp, q.EndTimestamp, q.ApiName)
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
@@ -446,7 +453,7 @@ func (c *Collector) collectCustomQuery(ctx context.Context, q *config.QueryConfi
 		return err
 	}
 	c.setWatermark(key, until)
-	log.Debugf("Custom query on %s: %d rows, %d already archived", q.Soql.From, len(rows), skipped)
+	log.Debugf("Custom query on %s (watermark key %s): %d rows, %d already archived", q.Soql.From, key, len(rows), skipped)
 	return nil
 }
 

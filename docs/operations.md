@@ -87,3 +87,36 @@ Delete the query watermark key `<instanceName>_query_<hash>_last_run_ts` and set
 `sf-archive-verify -bucket <bucket> -prefix <prefix>` checks every manifest against its object
 (record count, size, SHA-256) and exits non-zero on mismatches or objects without manifests.
 With `-ledger` it also reconciles against the mock org's ledger.
+
+## Upgrading from earlier builds
+
+These changes affect a deployment that already has data in S3 or state in
+Redis. A new deployment can ignore this section.
+
+- **Record envelope (manifest version 2).** Every line is now an envelope with
+  the Salesforce record under `payload`. Objects written by earlier builds have
+  `manifestVersion: 1` and the old line format. Keep them under a separate
+  prefix (or delete them if they were test data) rather than mixing the two
+  formats under one Athena table.
+- **`eventLog.instanceName` is required.** Cache keys are namespaced by it, so a
+  config without one is rejected at startup. Set it to the name the instance
+  had before, or its watermarks will not be found.
+- **Custom query state is re-keyed.** De-duplication markers were keyed by
+  object (`<instanceName>_soql_<object>_…`) and are now keyed by a hash of the
+  query, so two queries on one object no longer share them. The watermark key
+  `<instanceName>_query_<hash>_last_run_ts` keeps its form, but the hash now
+  treats select fields as a set, so it changes too. On the first poll after
+  upgrading, each custom query starts from `initialTimeInterval` and rows in
+  that window are archived once more. The duplicates carry the same `event_id`,
+  so queries can de-duplicate on it; the new watermark key is shown in the
+  debug-level "Custom query on …" log line.
+- **`cache.redis.keyPrefix` now applies to every key.** It previously applied
+  only to stream checkpoints. If you set it, event log watermarks and markers
+  move under the prefix: rename the existing `<instanceName>_*` keys to
+  `<keyPrefix><instanceName>_*`, or expect a re-collection over
+  `initialTimeInterval`.
+- **Custom queries with `endTimestamp`** now select on the end field alone, so
+  records that started before the window and finished inside it are archived.
+- **403 responses no longer tombstone EventLogFiles.** Only 400, 404 and 410
+  count towards `unavailableFileAttempts`; 403 (including
+  `REQUEST_LIMIT_EXCEEDED`) keeps blocking until it clears.
