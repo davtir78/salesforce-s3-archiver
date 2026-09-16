@@ -50,21 +50,24 @@ resource "aws_sns_topic_subscription" "alarms_email" {
   endpoint  = var.alarm_email
 }
 
-# A collector task that exits non-zero has hit a condition needing a human:
-# a rejected replay ID, a lost lease, or an archive that stayed unreachable.
+# A collector task that stops abnormally needs a human: a non-zero exit (a
+# rejected replay ID, a lost lease, an archive that stayed unreachable, fatal
+# auth failures) or a task that never started (image pull, secrets, networking),
+# which has no exit code at all. lastStatus STOPPED is terminal, so desiredStatus
+# is not matched: a stopped task is never restarted, the service starts a new one.
 resource "aws_cloudwatch_event_rule" "task_stopped" {
   name        = "${var.name}-task-stopped"
-  description = "Collector task stopped with a non-zero exit code"
+  description = "Collector task exited non-zero or failed to start"
   event_pattern = jsonencode({
     source      = ["aws.ecs"]
     detail-type = ["ECS Task State Change"]
     detail = {
-      clusterArn    = [aws_ecs_cluster.this.arn]
-      lastStatus    = ["STOPPED"]
-      desiredStatus = ["STOPPED"]
-      containers = {
-        exitCode = [{ "anything-but" = 0 }]
-      }
+      clusterArn = [aws_ecs_cluster.this.arn]
+      lastStatus = ["STOPPED"]
+      "$or" = [
+        { containers = { exitCode = [{ "anything-but" = 0 }] } },
+        { stopCode = ["TaskFailedToStart"] }
+      ]
     }
   })
 }
