@@ -93,6 +93,10 @@ func (e *encoder) WriteRecord(r Record) error {
 	}
 	e.count++
 	ts := line.Timestamp
+	if ts.IsZero() {
+		// A zero timestamp would make the manifest range start at year 1.
+		return nil
+	}
 	if e.first == nil || ts.Before(*e.first) {
 		t := ts
 		e.first = &t
@@ -183,24 +187,43 @@ func encodeObject(
 
 // DecodeObject reads a gzip NDJSON data object.
 func DecodeObject(r io.Reader, fn func(Line) error) error {
+	_, err := DecodeObjectCounted(r, fn)
+	return err
+}
+
+// DecodeObjectCounted is DecodeObject plus the uncompressed byte count, so
+// verification can check a manifest without buffering the whole object.
+func DecodeObjectCounted(r io.Reader, fn func(Line) error) (int64, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer gz.Close()
-	dec := json.NewDecoder(bufio.NewReader(gz))
+	counter := &countingReader{r: gz}
+	dec := json.NewDecoder(bufio.NewReader(counter))
 	dec.UseNumber()
 	for {
 		var line Line
 		err := dec.Decode(&line)
 		if err == io.EOF {
-			return nil
+			return counter.n, nil
 		}
 		if err != nil {
-			return err
+			return counter.n, err
 		}
 		if err := fn(line); err != nil {
-			return err
+			return counter.n, err
 		}
 	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }

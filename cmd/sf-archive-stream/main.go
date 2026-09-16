@@ -72,7 +72,10 @@ func run() int {
 		return resetCheckpoints(ctx, &conf, store, *resetTopics, *confirm)
 	}
 
-	metrics.Serve(ctx, conf.MetricsAddr)
+	if err := metrics.Serve(ctx, conf.MetricsAddr); err != nil {
+		log.Errorf("%v", err)
+		return 1
+	}
 	log.Infof("Starting stream collector %s for %d topic(s), version %s", conf.EventStream.Name, len(conf.EventStream.Topics), archive.CollectorVersion)
 
 	if err := stream.RunService(ctx, &conf, sink, store, stream.DefaultClientFactory(&conf)); err != nil {
