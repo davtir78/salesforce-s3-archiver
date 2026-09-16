@@ -116,6 +116,10 @@ variable "noncurrent_version_days" {
   description = "How long overwritten object versions are kept. Overwrites should not happen, so this is a recovery window."
   type        = number
   default     = 365
+  validation {
+    condition     = var.noncurrent_version_days >= 1 && floor(var.noncurrent_version_days) == var.noncurrent_version_days
+    error_message = "noncurrent_version_days must be a whole number of at least 1."
+  }
 }
 
 variable "stream_initial_replay" {

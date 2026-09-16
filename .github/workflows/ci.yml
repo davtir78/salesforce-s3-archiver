@@ -70,6 +70,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build --build-arg VERSION=${GITHUB_SHA::7} -t salesforce-s3-archiver:ci .
+      # The ECS task definitions run with-config as the container command, so
+      # check it is executable as the image's non-root user and writes the config.
+      - name: with-config smoke test
+        run: |
+          docker run --rm -e CONFIG_YAML='logLevel: info' salesforce-s3-archiver:ci with-config sf-archive-stream -version
+          docker run --rm -e CONFIG_YAML='logLevel: info' --entrypoint sh salesforce-s3-archiver:ci \
+            -c '(with-config sf-archive-stream -version) && test "$(cat /tmp/config.yml)" = "logLevel: info"'
 
   terraform:
     runs-on: ubuntu-latest

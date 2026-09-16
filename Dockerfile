@@ -21,7 +21,9 @@ FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc
 RUN apk add --no-cache ca-certificates tzdata \
  && adduser -D -H -u 10001 archiver
 COPY --from=build /out/ /usr/local/bin/
-COPY scripts/with-config.sh /usr/local/bin/with-config
+# --chmod: git and Linux build contexts keep the script's 0644 mode, and ECS
+# runs it directly as the container command.
+COPY --chmod=0755 scripts/with-config.sh /usr/local/bin/with-config
 USER 10001
 ENV LOG_LEVEL=info
 ENTRYPOINT []
