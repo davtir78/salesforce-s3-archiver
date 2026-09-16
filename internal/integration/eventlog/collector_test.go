@@ -671,3 +671,29 @@ func TestQueryHashIgnoresSelectOrder(t *testing.T) {
 		t.Errorf("different select lists must hash differently")
 	}
 }
+
+// Each archived version of a row needs its own event_id, or de-duplicating on
+// event_id downstream would drop later versions of a changed record.
+func TestCustomEventIdDistinguishesVersions(t *testing.T) {
+	q := &config.QueryConfig{Soql: config.SoqlConfig{From: "Account"}, Timestamp: "LastModifiedDate"}
+	v1 := customEventId(map[string]any{"Id": "001A", "LastModifiedDate": "2026-09-15T10:00:00.000+0000"}, q)
+	v2 := customEventId(map[string]any{"Id": "001A", "LastModifiedDate": "2026-09-15T11:00:00.000+0000"}, q)
+	if v1 == v2 {
+		t.Errorf("two versions of a record share event_id %q", v1)
+	}
+	if again := customEventId(map[string]any{"Id": "001A", "LastModifiedDate": "2026-09-15T10:00:00.000+0000"}, q); again != v1 {
+		t.Errorf("the same version must keep its event_id: %q != %q", again, v1)
+	}
+	if !strings.HasPrefix(v1, "001A@") {
+		t.Errorf("event_id %q should start with the record Id", v1)
+	}
+	end := &config.QueryConfig{Soql: config.SoqlConfig{From: "Job"}, Timestamp: "CreatedDate", EndTimestamp: "CompletedDate"}
+	a := customEventId(map[string]any{"Id": "707A", "CreatedDate": "t0", "CompletedDate": "t1"}, end)
+	b := customEventId(map[string]any{"Id": "707A", "CreatedDate": "t0", "CompletedDate": "t2"}, end)
+	if a == b {
+		t.Errorf("endTimestamp must be part of event_id: %q", a)
+	}
+	if id := customEventId(map[string]any{"Name": "x"}, q); id != "" {
+		t.Errorf("a row with no Id or custom ID has no event_id, got %q", id)
+	}
+}
