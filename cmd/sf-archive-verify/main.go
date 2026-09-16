@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -63,7 +64,8 @@ func main() {
 	region := flag.String("region", "", "AWS region")
 	strict := flag.Bool("strict", false, "also fail on data objects without a manifest (normally duplicates left by a failed manifest upload that the collector re-archived)")
 	ledgerURL := flag.String("ledger", "", "mock Salesforce ledger URL, e.g. http://localhost:8080/admin/ledger")
-	workers := flag.Int("workers", 8, "objects read concurrently")
+	workers := flag.Int("workers", 8, "objects and manifests read concurrently")
+	timeout := flag.Duration("timeout", 0, "give up after this long, e.g. 2h (default: no limit)")
 	out := flag.String("out", "", "write the JSON report to this file")
 	flag.Parse()
 	if *bucket == "" {
@@ -71,7 +73,15 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	if *workers < 1 {
+		*workers = 1
+	}
+	// No deadline by default: a large archive can take hours, and a deadline
+	// that expires mid-run would report every remaining object as unreadable.
+	ctx, cancel := context.Background(), context.CancelFunc(func() {})
+	if *timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), *timeout)
+	}
 	defer cancel()
 
 	sink, err := archive.NewS3Sink(ctx, archive.S3Options{Bucket: *bucket, Prefix: *prefix, Endpoint: *endpoint, ForcePathStyle: *endpoint != "", Region: *region})
@@ -94,10 +104,28 @@ func main() {
 	}
 
 	rep := report{Objects: len(dataKeys), Manifests: len(manifestKeys), RecordsBySource: map[string]int{}}
+	// Fetch manifests concurrently, then process them in listing order so
+	// duplicate detection is deterministic.
+	fetched := make([]archive.Manifest, len(manifestKeys))
+	fetchErrs := make([]error, len(manifestKeys))
+	var fetchWG sync.WaitGroup
+	fetchSem := make(chan struct{}, *workers)
+	for i, k := range manifestKeys {
+		fetchWG.Add(1)
+		fetchSem <- struct{}{}
+		go func() {
+			defer fetchWG.Done()
+			defer func() { <-fetchSem }()
+			fetchErrs[i] = getJSON(ctx, client, *bucket, k, &fetched[i])
+		}()
+	}
+	fetchWG.Wait()
+	checkDeadline(ctx)
+
 	manifests := map[string]archive.Manifest{}
-	for _, k := range manifestKeys {
-		var m archive.Manifest
-		if err := getJSON(ctx, client, *bucket, k, &m); err != nil {
+	for i, k := range manifestKeys {
+		m := fetched[i]
+		if err := fetchErrs[i]; err != nil {
 			// Report it and keep going; one corrupt manifest must not hide the rest.
 			rep.UnreadableManifests = append(rep.UnreadableManifests, fmt.Sprintf("%s: %v", k, err))
 			continue
@@ -193,6 +221,7 @@ func main() {
 		}()
 	}
 	wg.Wait()
+	checkDeadline(ctx)
 
 	for key := range manifests {
 		if !seenManifest[key] {
@@ -393,6 +422,14 @@ func fetchJSON(url string, v any) error {
 		return fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
 	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+// checkDeadline stops with exit code 2 if -timeout expired: the per-object
+// failures that follow an expired context say nothing about the archive.
+func checkDeadline(ctx context.Context) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		fail(fmt.Errorf("verification did not finish within -timeout; the report would be incomplete: %w", ctx.Err()))
+	}
 }
 
 func fail(err error) {

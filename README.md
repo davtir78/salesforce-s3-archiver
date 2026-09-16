@@ -69,7 +69,7 @@ Every line is a small envelope around the source record, unchanged, in `payload`
 
 | Field | Meaning |
 |---|---|
-| `event_id` | Salesforce event UUID (streams), record Id (SOQL), or a hash of file Id + line number (EventLogFile rows, which have no unique field of their own). The de-duplication key. |
+| `event_id` | Salesforce event UUID (streams), record Id plus its timestamp values, `<Id>@<timestamp>` (SOQL, so each archived version of a changed record is distinct), or a hash of file Id + line number (EventLogFile rows, which have no unique field of their own). The de-duplication key. |
 | `event_type` | `LoginEventStream`, `Login`, `SetupAuditTrail`, ... |
 | `timestamp` | Event time from the source, UTC |
 | `source` | `stream`, `eventlog`, `soql` or `limits` |

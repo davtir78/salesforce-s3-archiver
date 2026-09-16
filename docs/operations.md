@@ -124,9 +124,11 @@ non-empty:
 
 `objectsWithoutManifest` is reported but only fails the run with `-strict`: such objects are
 normally duplicates left when a manifest upload failed and the batch was archived again.
-`-workers` sets how many objects are read at once (default 8). With `-ledger` it also
+`-workers` sets how many objects and manifests are read at once (default 8), and `-timeout` (e.g.
+`2h`) bounds the whole run; by default there is no limit. With `-ledger` it also
 reconciles record identifiers against the mock org's ledger. Exit code 2 means the verifier
-itself could not run (bad flags, bucket not listable, ledger unreachable).
+itself could not run (bad flags, bucket not listable, ledger unreachable) or did not finish
+within `-timeout`.
 
 On AWS the cache and archive are only reachable from inside the VPC, so run recovery commands as
 one-off tasks:
