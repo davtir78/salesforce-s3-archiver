@@ -27,7 +27,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/davtir78/salesforce-s3-archiver/internal/archive"
 	"github.com/davtir78/salesforce-s3-archiver/internal/mocksf"
-	"golang.org/x/sync/errgroup"
 )
 
 type report struct {
@@ -121,17 +120,21 @@ func main() {
 		m[group][id]++
 	}
 
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(*workers)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, *workers)
 	for _, key := range dataKeys {
-		g.Go(func() error {
-			stats, lines, err := readObject(gctx, client, *bucket, key)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			stats, lines, err := readObject(ctx, client, *bucket, key)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
 				// One unreadable object must not abandon the whole report.
 				rep.UnreadableObjects = append(rep.UnreadableObjects, fmt.Sprintf("%s: %v", key, err))
-				return nil
+				return
 			}
 			m, ok := manifests[key]
 			if !ok {
@@ -161,12 +164,9 @@ func main() {
 					add(customIds, l.EventType, id)
 				}
 			}
-			return nil
-		})
+		}()
 	}
-	if err := g.Wait(); err != nil {
-		fail(err)
-	}
+	wg.Wait()
 
 	for key := range manifests {
 		if !seenManifest[key] {
