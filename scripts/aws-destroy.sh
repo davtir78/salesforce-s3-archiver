@@ -22,7 +22,8 @@ fi
 
 REGION="$(terraform output -raw region)"
 BUCKET="$(terraform output -raw bucket)"
-VARS=(-var admin_cidr=127.0.0.1/32)
+# Required variables need a value even to destroy; these do not affect it.
+VARS=(-var admin_cidr=127.0.0.1/32 -var image_tag=destroy)
 
 if [ "${FORCE_DESTROY_BUCKET:-false}" = "true" ]; then
   echo "==> FORCE_DESTROY_BUCKET=true: s3://$BUCKET and ALL archived objects will be deleted"

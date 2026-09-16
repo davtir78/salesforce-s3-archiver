@@ -16,10 +16,13 @@ import (
 )
 
 type AuthConfig struct {
-	TokenUrl   string          `mapstructure:"tokenUrl"`
-	UserPass   *UserPassAuth   `mapstructure:"userPass"`
-	Jwt        *JwtAuth        `mapstructure:"jwt"`
-	ClientCred *ClientCredAuth `mapstructure:"clientCred"`
+	TokenUrl string `mapstructure:"tokenUrl"`
+	// AllowInsecureHttp permits an http:// tokenUrl, which sends credentials
+	// and tokens unencrypted. Only for the mock org in local or test stacks.
+	AllowInsecureHttp bool            `mapstructure:"allowInsecureHttp"`
+	UserPass          *UserPassAuth   `mapstructure:"userPass"`
+	Jwt               *JwtAuth        `mapstructure:"jwt"`
+	ClientCred        *ClientCredAuth `mapstructure:"clientCred"`
 }
 
 type UserPassAuth struct {
@@ -33,6 +36,10 @@ type JwtAuth struct {
 	ClientId   string `mapstructure:"clientId"`
 	PrivateKey string `mapstructure:"privateKey"`
 	Username   string `mapstructure:"username"`
+	// Audience is the JWT aud claim. Salesforce expects the login server
+	// (https://login.salesforce.com, https://test.salesforce.com for sandboxes)
+	// or an Experience Cloud site URL. Defaults to tokenUrl.
+	Audience string `mapstructure:"audience"`
 }
 
 type ClientCredAuth struct {
@@ -228,28 +235,35 @@ func envVarDecoder() mapstructure.DecodeHookFunc {
 	}
 }
 
-// Check if the value of a field is an env var "$VAR_NAM", and read it.
+// Check if the value of a field is an env var "$VAR_NAME", and read it.
 func scanEnvVars(dict map[string]any) {
 	for key, val := range dict {
-		switch val := val.(type) {
-		case map[string]any:
-			scanEnvVars(val)
-		case string:
-			var re = regexp.MustCompile(`^\$[a-zA-Z_]+[a-zA-Z0-9_]*`)
-			loc := re.FindStringIndex(val)
-			// Regex is a full match
-			isEnvVar := len(loc) == 2 && (loc[0] == 0 && loc[1] == len(val))
-			if isEnvVar {
-				varName := val[1:]
-				envVal, exists := os.LookupEnv(varName)
-				if exists {
-					dict[key] = envVal
-				} else {
-					log.Fatalf(fmt.Errorf("Env var %s does not exist", varName))
-				}
+		dict[key] = expandEnvVar(val)
+	}
+}
+
+var envVarRef = regexp.MustCompile(`^\$[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// expandEnvVar replaces "$VAR" strings with the environment variable, walking
+// into maps and lists (e.g. customQueries or topics).
+func expandEnvVar(val any) any {
+	switch v := val.(type) {
+	case map[string]any:
+		scanEnvVars(v)
+	case []any:
+		for i, item := range v {
+			v[i] = expandEnvVar(item)
+		}
+	case string:
+		if envVarRef.MatchString(v) {
+			envVal, exists := os.LookupEnv(v[1:])
+			if !exists {
+				log.Fatalf(fmt.Errorf("Env var %s does not exist", v[1:]))
 			}
+			return envVal
 		}
 	}
+	return val
 }
 
 // ReadConfigFile loads a YAML config file. Values of the form "$VAR" are

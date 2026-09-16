@@ -131,6 +131,6 @@ for attempt in 1 2 3 4 5; do
 done
 
 aws logs filter-log-events --log-group-name "$LOG_GROUP" --start-time $(( ($(date +%s) - DURATION - 900) * 1000 )) \
-  --filter-pattern '"level":"ERROR"' --query 'events[].message' --output text > "$OUT/errors.log" 2>/dev/null
+  --filter-pattern '{ $.level = "ERROR" }' --query 'events[].message' --output text | tr '\t' '\n' | grep -v '^None$' > "$OUT/errors.log"
 log "collector ERROR log lines: $(wc -l < "$OUT/errors.log")"
 [ "$code" = "0" ]

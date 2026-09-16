@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 )
@@ -21,6 +22,22 @@ func CheckAuth(auth *AuthConfig) error {
 	}
 	if !CheckUrl(auth.TokenUrl) {
 		return errors.New("Invalid URL 'auth.tokenUrl'")
+	}
+	u, err := url.Parse(auth.TokenUrl)
+	if err != nil || u.Host == "" {
+		return errors.New("Invalid URL 'auth.tokenUrl': expected e.g. https://example.my.salesforce.com")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+	case "http":
+		// The client secret, password or JWT assertion and every access token
+		// would cross the network unencrypted.
+		if !auth.AllowInsecureHttp {
+			return errors.New("'auth.tokenUrl' must use https (set 'auth.allowInsecureHttp: true' only for a local mock org)")
+		}
+		log.Warnf("'auth.tokenUrl' uses http: credentials and tokens are sent unencrypted (allowInsecureHttp)")
+	default:
+		return fmt.Errorf("'auth.tokenUrl' must use https, got scheme '%s'", u.Scheme)
 	}
 	definedAuthMethods := 0
 	if auth.Jwt != nil {

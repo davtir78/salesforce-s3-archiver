@@ -20,7 +20,7 @@ func validCache() *config.CacheConfig {
 
 func validAuth() config.AuthConfig {
 	return config.AuthConfig{
-		TokenUrl: "http://example.com",
+		TokenUrl: "https://example.com",
 		UserPass: &config.UserPassAuth{
 			ClientId:     "client_id",
 			ClientSecret: "client_secret",

@@ -113,3 +113,45 @@ func TestReadConfigFileEnvVars(t *testing.T) {
 		t.Errorf("bucket = %q, want from-env", conf.Archive.S3.Bucket)
 	}
 }
+
+func TestReadConfigFileEnvVarsInLists(t *testing.T) {
+	t.Setenv("SF_ARCHIVE_TEST_TOPIC", "/event/LoginEventStream")
+	path := filepath.Join(t.TempDir(), "config.yml")
+	content := "version: \"3.0\"\narchive:\n  local:\n    dir: out\neventStream:\n  topics:\n    - $SF_ARCHIVE_TEST_TOPIC\n    - /event/ApiEventStream\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conf, err := ReadConfigFile(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	topics := conf.EventStream.Topics
+	if len(topics) != 2 || topics[0] != "/event/LoginEventStream" || topics[1] != "/event/ApiEventStream" {
+		t.Errorf("topics = %v, want the env var expanded inside the list", topics)
+	}
+}
+
+func TestCheckAuthRequiresHttps(t *testing.T) {
+	auth := func(url string, allowHttp bool) *AuthConfig {
+		return &AuthConfig{TokenUrl: url, AllowInsecureHttp: allowHttp,
+			ClientCred: &ClientCredAuth{ClientId: "id", ClientSecret: "secret"}}
+	}
+	cases := []struct {
+		url       string
+		allowHttp bool
+		ok        bool
+	}{
+		{"https://example.my.salesforce.com", false, true},
+		{"http://example.my.salesforce.com", false, false},
+		{"http://mock-salesforce:8080", true, true},
+		{"HTTPS://example.my.salesforce.com", false, true},
+		{"ftp://example.com", true, false},
+		{"https://", false, false},
+	}
+	for _, c := range cases {
+		err := CheckAuth(auth(c.url, c.allowHttp))
+		if (err == nil) != c.ok {
+			t.Errorf("tokenUrl %q allowInsecureHttp=%v: err=%v, want ok=%v", c.url, c.allowHttp, err, c.ok)
+		}
+	}
+}
