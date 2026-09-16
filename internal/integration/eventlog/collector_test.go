@@ -603,3 +603,71 @@ func TestTransientDownloadFailureKeepsBlocking(t *testing.T) {
 		}
 	}
 }
+
+// With endTimestamp, a record that started before the window but finished
+// inside it must be archived; one still running must wait until it finishes.
+func TestEndTimestampSelectsRecordsFinishingInWindow(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.SkipLogFiles = true
+	h.conf.CustomQueries = []config.QueryConfig{{
+		Soql:         config.SoqlConfig{Select: []string{"Id", "CreatedDate", "CompletedDate"}, From: "SetupAuditTrail"},
+		ApiVer:       "64.0",
+		ApiName:      "rest",
+		Timestamp:    "CreatedDate",
+		EndTimestamp: "CompletedDate",
+	}}
+	// The initial window is 2h; these started 5h ago.
+	started := time.Now().Add(-5 * time.Hour)
+	finished := h.mock.AddCustomRecords("SetupAuditTrail", started, 3)
+	h.mock.SetCustomField("SetupAuditTrail", finished, "CompletedDate", time.Now().Add(-10*time.Minute))
+	running := h.mock.AddCustomRecords("SetupAuditTrail", started, 2)
+
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	archived := func() map[string]int {
+		lines, _ := h.sink.Lines()
+		m := map[string]int{}
+		for _, l := range lines {
+			id, _ := l.Payload["Id"].(string)
+			m[id]++
+		}
+		return m
+	}
+	got := archived()
+	for _, id := range finished {
+		if got[id] != 1 {
+			t.Errorf("record %s started before the window and finished inside it: archived %d times, want 1", id, got[id])
+		}
+	}
+	for _, id := range running {
+		if got[id] != 0 {
+			t.Errorf("record %s has not finished and must not be archived yet", id)
+		}
+	}
+
+	// Once the running records finish they are archived, exactly once.
+	h.mock.SetCustomField("SetupAuditTrail", running, "CompletedDate", time.Now().Add(-time.Second))
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got = archived()
+	for _, id := range append(finished, running...) {
+		if got[id] != 1 {
+			t.Errorf("record %s archived %d times after it finished, want 1", id, got[id])
+		}
+	}
+}
+
+// Reordering the select list must not reset a query's watermark and markers.
+func TestQueryHashIgnoresSelectOrder(t *testing.T) {
+	a := &config.QueryConfig{Soql: config.SoqlConfig{From: "T", Select: []string{"Id", "Action", "CreatedDate"}}, Timestamp: "CreatedDate"}
+	b := &config.QueryConfig{Soql: config.SoqlConfig{From: "T", Select: []string{"CreatedDate", " id", "Action"}}, Timestamp: "CreatedDate"}
+	if queryHash(a) != queryHash(b) {
+		t.Errorf("select order changed the query hash")
+	}
+	c := &config.QueryConfig{Soql: config.SoqlConfig{From: "T", Select: []string{"Id", "Section", "CreatedDate"}}, Timestamp: "CreatedDate"}
+	if queryHash(a) == queryHash(c) {
+		t.Errorf("different select lists must hash differently")
+	}
+}

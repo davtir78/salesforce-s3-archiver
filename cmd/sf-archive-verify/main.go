@@ -30,17 +30,22 @@ import (
 )
 
 type report struct {
-	Objects            int            `json:"objects"`
-	Manifests          int            `json:"manifests"`
-	ManifestMismatches []string       `json:"manifestMismatches"`
-	ManifestsNoObject  []string       `json:"manifestsWithoutObject"`
-	ObjectsWithoutMan  int            `json:"objectsWithoutManifest"`
-	UnreadableObjects  []string       `json:"unreadableObjects"`
-	RecordsBySource    map[string]int `json:"recordsBySource"`
-	Streams            map[string]gap `json:"streams,omitempty"`
-	EventLogRows       *gap           `json:"eventLogRows,omitempty"`
-	CustomRecords      map[string]gap `json:"customRecords,omitempty"`
-	OK                 bool           `json:"ok"`
+	Objects            int      `json:"objects"`
+	Manifests          int      `json:"manifests"`
+	ManifestMismatches []string `json:"manifestMismatches"`
+	ManifestsNoObject  []string `json:"manifestsWithoutObject"`
+	ObjectsWithoutMan  int      `json:"objectsWithoutManifest"`
+	UnreadableObjects  []string `json:"unreadableObjects"`
+	// Manifests that could not be read or parsed.
+	UnreadableManifests []string `json:"unreadableManifests"`
+	// Manifests in a format this verifier does not read (e.g. written before
+	// the record envelope); their objects are not decoded.
+	UnsupportedManifests []string       `json:"unsupportedManifests"`
+	RecordsBySource      map[string]int `json:"recordsBySource"`
+	Streams              map[string]gap `json:"streams,omitempty"`
+	EventLogRows         *gap           `json:"eventLogRows,omitempty"`
+	CustomRecords        map[string]gap `json:"customRecords,omitempty"`
+	OK                   bool           `json:"ok"`
 }
 
 type gap struct {
@@ -90,11 +95,12 @@ func main() {
 
 	rep := report{Objects: len(dataKeys), Manifests: len(manifestKeys), RecordsBySource: map[string]int{}}
 	manifests := map[string]archive.Manifest{}
-	seenManifest := map[string]bool{}
 	for _, k := range manifestKeys {
 		var m archive.Manifest
 		if err := getJSON(ctx, client, *bucket, k, &m); err != nil {
-			fail(fmt.Errorf("reading manifest %s: %w", k, err))
+			// Report it and keep going; one corrupt manifest must not hide the rest.
+			rep.UnreadableManifests = append(rep.UnreadableManifests, fmt.Sprintf("%s: %v", k, err))
+			continue
 		}
 		if m.ObjectKey == "" {
 			rep.ManifestMismatches = append(rep.ManifestMismatches, k+" (manifest has no objectKey)")
@@ -104,14 +110,24 @@ func main() {
 			rep.ManifestMismatches = append(rep.ManifestMismatches, k+" (duplicate objectKey "+m.ObjectKey+")")
 			continue
 		}
+		if m.ManifestVersion != archive.ManifestVersion {
+			// Earlier line formats do not decode as envelopes; comparing them
+			// would report every record missing rather than the real cause.
+			rep.UnsupportedManifests = append(rep.UnsupportedManifests,
+				fmt.Sprintf("%s (manifestVersion %d, this verifier reads %d)", k, m.ManifestVersion, archive.ManifestVersion))
+		}
 		manifests[m.ObjectKey] = m
 	}
 
+	// Record identifiers are only kept when reconciling against a ledger, and
+	// then only the identifier, not the record.
+	reconcile := *ledgerURL != ""
 	var (
-		mu        sync.Mutex
-		streamIds = map[string]map[string]int{}
-		elfIds    = map[string]int{}
-		customIds = map[string]map[string]int{}
+		mu           sync.Mutex
+		seenManifest = map[string]bool{}
+		streamIds    = map[string]map[string]int{}
+		elfIds       = map[string]int{}
+		customIds    = map[string]map[string]int{}
 	)
 	add := func(m map[string]map[string]int, group, id string) {
 		if m[group] == nil {
@@ -123,45 +139,55 @@ func main() {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, *workers)
 	for _, key := range dataKeys {
+		m, hasManifest := manifests[key] // manifests is read-only from here on
+		if hasManifest && m.ManifestVersion != archive.ManifestVersion {
+			mu.Lock()
+			seenManifest[key] = true // already reported as unsupported
+			mu.Unlock()
+			continue
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			stats, lines, err := readObject(ctx, client, *bucket, key)
+			bySource := map[string]int{}
+			var refs []recordRef
+			stats, err := readObject(ctx, client, *bucket, key, func(l archive.Line) {
+				bySource[l.Source]++
+				if reconcile {
+					refs = append(refs, refFor(l, m.Lineage["topic"]))
+				}
+			})
+
 			mu.Lock()
 			defer mu.Unlock()
+			if hasManifest {
+				// Reported once: as unreadable or mismatched, never also as a
+				// manifest without an object.
+				seenManifest[key] = true
+			}
 			if err != nil {
 				// One unreadable object must not abandon the whole report.
 				rep.UnreadableObjects = append(rep.UnreadableObjects, fmt.Sprintf("%s: %v", key, err))
 				return
 			}
-			m, ok := manifests[key]
-			if !ok {
+			if !hasManifest {
 				rep.ObjectsWithoutMan++
-			} else {
-				seenManifest[key] = true
-				if why := stats.compare(m); why != "" {
-					rep.ManifestMismatches = append(rep.ManifestMismatches, key+" ("+why+")")
-				}
+			} else if why := stats.compare(m); why != "" {
+				rep.ManifestMismatches = append(rep.ManifestMismatches, key+" ("+why+")")
 			}
-			for _, l := range lines {
-				rep.RecordsBySource[l.Source]++
-				switch l.Source {
+			for source, n := range bySource {
+				rep.RecordsBySource[source] += n
+			}
+			for _, r := range refs {
+				switch r.source {
 				case archive.SourceStream:
-					topic := ""
-					if ok {
-						topic = m.Lineage["topic"]
-					}
-					// The mock ledger tracks EventIdentifier; event_id is EventUuid.
-					id, _ := l.Payload["EventIdentifier"].(string)
-					add(streamIds, topic, id)
+					add(streamIds, r.group, r.id)
 				case archive.SourceEventLog:
-					id, _ := l.Payload["REQUEST_ID"].(string)
-					elfIds[id]++
+					elfIds[r.id]++
 				case archive.SourceSOQL:
-					id, _ := l.Payload["Id"].(string)
-					add(customIds, l.EventType, id)
+					add(customIds, r.group, r.id)
 				}
 			}
 		}()
@@ -173,12 +199,15 @@ func main() {
 			rep.ManifestsNoObject = append(rep.ManifestsNoObject, key)
 		}
 	}
-	sort.Strings(rep.ManifestsNoObject)
-	sort.Strings(rep.ManifestMismatches)
+	for _, list := range [][]string{rep.ManifestsNoObject, rep.ManifestMismatches, rep.UnreadableObjects, rep.UnreadableManifests, rep.UnsupportedManifests} {
+		sort.Strings(list)
+	}
 
 	rep.OK = len(rep.ManifestMismatches) == 0 &&
 		len(rep.ManifestsNoObject) == 0 &&
 		len(rep.UnreadableObjects) == 0 &&
+		len(rep.UnreadableManifests) == 0 &&
+		len(rep.UnsupportedManifests) == 0 &&
 		(!*strict || rep.ObjectsWithoutMan == 0)
 
 	if *ledgerURL != "" {
@@ -257,47 +286,47 @@ func sameTime(a, b *time.Time) bool {
 	}
 }
 
-// readObject streams the object once: hashing and counting the compressed bytes
-// while decoding the NDJSON, instead of holding several copies in memory.
-func readObject(ctx context.Context, client *s3.Client, bucket, key string) (objectStats, []archive.Line, error) {
+// readObject streams a data object from S3 through scanObject.
+func readObject(ctx context.Context, client *s3.Client, bucket, key string, visit func(archive.Line)) (objectStats, error) {
 	obj, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 	if err != nil {
-		return objectStats{}, nil, err
+		return objectStats{}, err
 	}
 	defer obj.Body.Close()
+	return scanObject(obj.Body, visit)
+}
 
+// scanObject reads the object once, hashing and counting the compressed bytes
+// while decoding the NDJSON. Each record is passed to visit and then dropped, so
+// memory does not grow with the object.
+func scanObject(r io.Reader, visit func(archive.Line)) (objectStats, error) {
 	hasher := sha256.New()
-	counter := &countingReader{r: io.TeeReader(obj.Body, hasher)}
+	counter := &countingReader{r: io.TeeReader(r, hasher)}
 	var (
 		stats objectStats
-		lines []archive.Line
+		times archive.TimestampRange
 	)
 	uncompressed, err := archive.DecodeObjectCounted(counter, func(l archive.Line) error {
 		stats.records++
-		ts := l.Timestamp
-		if stats.first == nil || ts.Before(*stats.first) {
-			t := ts
-			stats.first = &t
+		times.Add(l.Timestamp)
+		if visit != nil {
+			visit(l)
 		}
-		if stats.last == nil || ts.After(*stats.last) {
-			t := ts
-			stats.last = &t
-		}
-		lines = append(lines, l)
 		return nil
 	})
 	if err != nil {
-		return objectStats{}, nil, err
+		return objectStats{}, err
 	}
 	// Drain any trailer the gzip reader left so the byte count and hash cover
 	// the whole object.
 	if _, err := io.Copy(io.Discard, counter); err != nil {
-		return objectStats{}, nil, err
+		return objectStats{}, err
 	}
+	stats.first, stats.last = times.First, times.Last
 	stats.compressed = counter.n
 	stats.uncompressed = uncompressed
 	stats.sha256 = hex.EncodeToString(hasher.Sum(nil))
-	return stats, lines, nil
+	return stats, nil
 }
 
 type countingReader struct {
@@ -369,4 +398,26 @@ func fetchJSON(url string, v any) error {
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 	os.Exit(2)
+}
+
+// recordRef is the part of a record the ledger reconciliation needs.
+type recordRef struct {
+	source, group, id string
+}
+
+// refFor extracts the identifier the mock ledger tracks for each source.
+func refFor(l archive.Line, topic string) recordRef {
+	switch l.Source {
+	case archive.SourceStream:
+		// The mock ledger tracks EventIdentifier; event_id is EventUuid.
+		id, _ := l.Payload["EventIdentifier"].(string)
+		return recordRef{l.Source, topic, id}
+	case archive.SourceEventLog:
+		id, _ := l.Payload["REQUEST_ID"].(string)
+		return recordRef{l.Source, "", id}
+	case archive.SourceSOQL:
+		id, _ := l.Payload["Id"].(string)
+		return recordRef{l.Source, l.EventType, id}
+	}
+	return recordRef{source: l.Source}
 }

@@ -37,7 +37,7 @@ func (s *LocalSink) Write(ctx context.Context, meta ObjectMeta, fill func(w Reco
 		manifestKey = joinPrefix(s.Prefix, manifestKey)
 		m.ObjectKey = dataKey
 
-		if err := s.atomicWrite(dataKey, body); err != nil {
+		if err := s.atomicWrite(dataKey, ctxReader{ctx, body}); err != nil {
 			return fmt.Errorf("writing data object: %w", err)
 		}
 		mb, err := json.MarshalIndent(m, "", "  ")
@@ -82,4 +82,18 @@ func (s *LocalSink) atomicWrite(key string, r io.Reader) error {
 
 func (s *LocalSink) atomicWriteBytes(key string, b []byte) error {
 	return s.atomicWrite(key, bytesReader(b))
+}
+
+// ctxReader stops a copy once ctx is cancelled, so a shutdown is not held up
+// by a large object.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }

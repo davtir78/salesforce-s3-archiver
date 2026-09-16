@@ -78,11 +78,17 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("Error %d, body: %s", e.StatusCode, e.Body)
 }
 
-// Permanent reports whether retrying the same request is pointless.
-// 401 is excluded (handled by re-login) and so is 429 (rate limiting).
+// Permanent reports whether retrying the same request is pointless. It is an
+// allowlist: a permanent error lets a file be tombstoned and skipped, so any
+// status that can recover must stay transient. 401 is handled by re-login,
+// 429 is rate limiting, and 403 covers REQUEST_LIMIT_EXCEEDED (resets within
+// 24 hours) as well as permission errors an admin can fix.
 func (e *HTTPError) Permanent() bool {
-	return e.StatusCode >= 400 && e.StatusCode < 500 &&
-		e.StatusCode != http.StatusUnauthorized && e.StatusCode != http.StatusTooManyRequests
+	switch e.StatusCode {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusGone:
+		return true
+	}
+	return false
 }
 
 func generateError(resp *http.Response) error {
@@ -249,13 +255,15 @@ func RequestCustomQuery(ctx context.Context, customQuery *config.QueryConfig, co
 	if customQuery.Soql.Where != "" {
 		soqlModel.AndWhere(customQuery.Soql.Where)
 	}
-	soqlModel.AndWhere(customQuery.Timestamp + " >= " + since.UTC().Format(time.RFC3339))
 	if customQuery.EndTimestamp == "" {
+		soqlModel.AndWhere(customQuery.Timestamp + " >= " + since.UTC().Format(time.RFC3339))
 		soqlModel.AndWhere(customQuery.Timestamp + " <= " + until.UTC().Format(time.RFC3339))
 	} else {
-		// Bound the window on the end field at both ends. Filtering only the
-		// upper bound skipped records that started before "since" and finished
+		// Select on the end field alone: a record is archived once it has
+		// finished, in the window where it finished. Also bounding the start
+		// field would skip records that started before "since" and finished
 		// inside the window (e.g. a job running longer than the overlap).
+		// Row de-duplication covers the overlap between windows.
 		soqlModel.AndWhere(customQuery.EndTimestamp + " >= " + since.UTC().Format(time.RFC3339))
 		soqlModel.AndWhere(customQuery.EndTimestamp + " <= " + until.UTC().Format(time.RFC3339))
 	}

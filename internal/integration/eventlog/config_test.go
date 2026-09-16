@@ -125,3 +125,19 @@ func TestIntegrityCheck(t *testing.T) {
 		t.Errorf("Integrity check didn't catch an empty event log auth username")
 	}
 }
+
+func TestLimitOrOffsetDetection(t *testing.T) {
+	for tail, want := range map[string]bool{
+		"LIMIT 10":               true,
+		"limit(10)":              true,
+		"ORDER BY Id\nOFFSET 5":  true,
+		"ORDER BY Id LIMIT\t5":   true,
+		"ORDER BY CreatedDate":   false,
+		"ORDER BY LimitField__c": false,
+		"":                       false,
+	} {
+		if got := limitOrOffset.MatchString(tail); got != want {
+			t.Errorf("tail %q: detected=%v, want %v", tail, got, want)
+		}
+	}
+}
