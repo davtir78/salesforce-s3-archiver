@@ -29,6 +29,9 @@ type harness struct {
 	sink     *archive.MemorySink
 	store    *checkpoint.MemoryStore
 	key      string
+	// active mirrors the subscriber's readiness callback, as RunService wires it.
+	active     atomic.Bool
+	everActive atomic.Bool
 }
 
 func newHarness(t *testing.T, opts mocksf.Options) *harness {
@@ -93,7 +96,14 @@ func (h *harness) run(opts SubscriberOptions, store checkpoint.Store) (done <-ch
 	var result error
 	go func() {
 		defer closeFn()
-		result = NewSubscriber(opts, client, h.sink, store).Run(ctx)
+		sub := NewSubscriber(opts, client, h.sink, store)
+		sub.OnActive = func(on bool) {
+			h.active.Store(on)
+			if on {
+				h.everActive.Store(true)
+			}
+		}
+		result = sub.Run(ctx)
 		close(finished)
 		notify <- result
 	}()
@@ -782,8 +792,52 @@ func TestRepeatedAuthFailuresAreFatal(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("collector kept retrying bad credentials")
 	}
-	if metrics.IsReady() {
+	if h.everActive.Load() {
 		t.Errorf("must not report ready while authentication is failing")
+	}
+}
+
+// Credentials revoked while the collector is running must also become fatal,
+// not retry forever against a session that was once healthy.
+func TestCredentialsRevokedMidRunAreFatal(t *testing.T) {
+	h := newHarness(t, mocksf.Options{})
+	h.publish(5)
+	opts := h.options()
+	opts.RetryDelay = time.Millisecond
+	done, stop := h.run(opts, h.store)
+	defer stop()
+	h.waitAllArchived(10 * time.Second)
+	if !h.active.Load() {
+		t.Fatal("expected the subscriber to report ready while receiving events")
+	}
+
+	h.mock.SetFaults(mocksf.Faults{FailLogins: 1000})
+	h.mock.ExpireTokens()
+	select {
+	case err := <-done:
+		if !IsFatal(err) || !strings.Contains(err.Error(), "authentication failed") {
+			t.Fatalf("got %v, want a fatal authentication error", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("collector kept retrying revoked credentials")
+	}
+	if h.active.Load() {
+		t.Errorf("must not report ready after credentials were revoked")
+	}
+}
+
+// Backoff is spread so collectors that fail together do not retry in lockstep.
+func TestJitterStaysWithinBounds(t *testing.T) {
+	for _, d := range []time.Duration{0, 1, 2, time.Millisecond, time.Second} {
+		for i := 0; i < 100; i++ {
+			got := jitter(d)
+			if d < 2 && got != d {
+				t.Fatalf("jitter(%v) = %v, want unchanged", d, got)
+			}
+			if d >= 2 && (got < d/2 || got >= d) {
+				t.Fatalf("jitter(%v) = %v, want within [%v, %v)", d, got, d/2, d)
+			}
+		}
 	}
 }
 

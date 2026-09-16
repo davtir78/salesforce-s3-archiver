@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
@@ -239,18 +240,36 @@ func (s *Subscriber) Run(ctx context.Context) error {
 			reason = "auth"
 		}
 		metrics.Reconnects.WithLabelValues(s.opts.Topic, reason).Inc()
-		s.logger.Warn("Subscription ended; reconnecting", "error", fmt.Sprint(err), "backoff", backoff.String())
-		if sleepErr := sleep(ctx, backoff); sleepErr != nil {
+		// A session that received data resets the backoff before this sleep, so
+		// the first retry after a long healthy run is fast. A session that ended
+		// on a schema fetch failure does not: it may have been healthy only
+		// until it met an event whose schema cannot be fetched.
+		var schemaErr *grpcclient.SchemaFetchError
+		progressed := healthy && !errors.As(err, &schemaErr)
+		if progressed {
+			backoff = s.opts.RetryDelay
+		}
+		delay := jitter(backoff)
+		s.logger.Warn("Subscription ended; reconnecting", "error", fmt.Sprint(err), "backoff", delay.String())
+		if sleepErr := sleep(ctx, delay); sleepErr != nil {
 			return nil
 		}
-		if healthy {
-			// The session worked for a while; treat the next failure as fresh
-			// instead of inheriting an old backoff.
-			backoff = s.opts.RetryDelay
-		} else if backoff *= 2; backoff > s.opts.MaxBackoff {
-			backoff = s.opts.MaxBackoff
+		if !progressed {
+			if backoff *= 2; backoff > s.opts.MaxBackoff {
+				backoff = s.opts.MaxBackoff
+			}
 		}
 	}
+}
+
+// jitter spreads retries over [d/2, d) so collectors that fail together (a
+// shared cache or Salesforce outage) do not retry in lockstep.
+func jitter(d time.Duration) time.Duration {
+	if d < 2 {
+		return d
+	}
+	half := d / 2
+	return half + rand.N(half)
 }
 
 // renewLease keeps the lease alive until the subscriber returns. It deliberately
@@ -295,15 +314,8 @@ type recvResult struct {
 func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr error) {
 	if s.client.OrgId() == "" {
 		if err := s.client.Authenticate(ctx); err != nil {
-			s.authFailures++
-			if s.authFailures >= maxAuthFailures {
-				// Credentials that never work are an operator problem: retrying
-				// forever would look healthy while archiving nothing.
-				return fatal(fmt.Errorf("authentication failed %d times in a row: %w", s.authFailures, err))
-			}
-			return fmt.Errorf("authenticating (attempt %d of %d): %w", s.authFailures, maxAuthFailures, err)
+			return s.authFailed(fmt.Errorf("authenticating: %w", err))
 		}
-		s.authFailures = 0
 	}
 
 	s.sessionHealthy = false
@@ -405,6 +417,9 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 			idle.Reset(streamIdleTimeout)
 			if !s.sessionHealthy {
 				s.sessionHealthy = true
+				// Only a session that receives data proves the credentials work;
+				// a successful login alone does not (e.g. a user without access).
+				s.authFailures = 0
 				if s.OnActive != nil {
 					s.OnActive(true)
 				}
@@ -522,8 +537,19 @@ func (s *Subscriber) classifyStreamError(ctx context.Context, stream proto.PubSu
 	switch {
 	case code == errorCodeAuth || st.Code() == codes.Unauthenticated:
 		s.logger.Warn("Pub/Sub session rejected; re-authenticating", "errorCode", code)
+		if s.sessionHealthy {
+			// Rejected after working (e.g. a token expired): start counting afresh.
+			s.authFailures = 0
+		}
 		if authErr := s.client.Authenticate(ctx); authErr != nil {
-			return fmt.Errorf("re-authenticating: %w", authErr)
+			return s.authFailed(fmt.Errorf("re-authenticating: %w", authErr))
+		}
+		if !s.sessionHealthy {
+			// Login succeeds but the session is rejected before any data: count
+			// it, or a user without Pub/Sub access would retry forever.
+			if fatalErr := s.authFailed(err); IsFatal(fatalErr) {
+				return fatalErr
+			}
 		}
 		return &authError{err}
 	case strings.Contains(strings.ToLower(code), "replayid"):
@@ -533,6 +559,19 @@ func (s *Subscriber) classifyStreamError(ctx context.Context, stream proto.PubSu
 	default:
 		return fmt.Errorf("subscription stream error (error-code %q): %w", code, err)
 	}
+}
+
+// authFailed counts a failed login or rejected session. Consecutive failures
+// before any data arrives are fatal after maxAuthFailures: credentials that were
+// revoked or never worked are an operator problem, and retrying forever would
+// archive nothing while the process keeps running. The count resets when a
+// session receives data.
+func (s *Subscriber) authFailed(err error) error {
+	s.authFailures++
+	if s.authFailures >= maxAuthFailures {
+		return fatal(fmt.Errorf("authentication failed %d times in a row: %w", s.authFailures, err))
+	}
+	return &authError{fmt.Errorf("attempt %d of %d: %w", s.authFailures, maxAuthFailures, err)}
 }
 
 type authError struct{ err error }
@@ -620,7 +659,7 @@ func (s *Subscriber) writeWithRetry(ctx context.Context, meta archive.ObjectMeta
 		if attempt == attempts {
 			break
 		}
-		if sleep(ctx, delay) != nil {
+		if sleep(ctx, jitter(delay)) != nil {
 			break
 		}
 		if delay *= 2; delay > 30*time.Second {
@@ -663,7 +702,7 @@ func (s *Subscriber) commit(ctx context.Context, replayId []byte, newestEvent *t
 			break
 		}
 		s.logger.Warn("Checkpoint commit failed; retrying", "attempt", attempt, "error", err.Error())
-		if sleep(ctx, delay) != nil {
+		if sleep(ctx, jitter(delay)) != nil {
 			break
 		}
 		if delay *= 2; delay > 5*time.Second {
