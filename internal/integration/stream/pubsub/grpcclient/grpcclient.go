@@ -176,7 +176,9 @@ func (c *PubSubClient) GetSchema(ctx context.Context, schemaId string) (*proto.S
 func (c *PubSubClient) DecodeEvent(ctx context.Context, event *proto.ConsumerEvent) (map[string]any, string, error) {
 	entry, err := c.fetchSchema(ctx, event.GetEvent().GetSchemaId())
 	if err != nil {
-		return nil, "", fmt.Errorf("fetching schema %s: %w", event.GetEvent().GetSchemaId(), err)
+		// Transport or auth failure, not a corrupt event: the caller can
+		// reconnect instead of stopping the collector.
+		return nil, "", &SchemaFetchError{SchemaId: event.GetEvent().GetSchemaId(), Err: err}
 	}
 	parsed, _, err := entry.codec.NativeFromBinary(event.GetEvent().GetPayload())
 	if err != nil {
@@ -255,3 +257,16 @@ func printTrailer(trailer metadata.MD) {
 		log.Debugf("[trailer] %s = %s", key, val)
 	}
 }
+
+// SchemaFetchError is returned when a schema could not be fetched (network,
+// timeout, expired session). The event itself may be perfectly decodable.
+type SchemaFetchError struct {
+	SchemaId string
+	Err      error
+}
+
+func (e *SchemaFetchError) Error() string {
+	return fmt.Sprintf("fetching schema %s: %v", e.SchemaId, e.Err)
+}
+
+func (e *SchemaFetchError) Unwrap() error { return e.Err }

@@ -16,6 +16,13 @@
 
 Both collectors serve Prometheus metrics on `metricsAddr` (`/metrics`, `/healthz`, `/readyz`).
 
+For the stream collector, `/readyz` means every topic has a session that has received data
+(events or a keepalive) and holds its lease. Readiness can lag a feed that stalls without
+closing by up to the 300-second idle timeout, which then ends the session. A healthy topic
+commits a checkpoint at least on every keepalive (about every 270 seconds), so to catch
+sustained problems alert when `sfarchive_stream_last_commit_timestamp_seconds` is more than
+about 10 minutes old.
+
 | Metric | Meaning | Suggested alert |
 |---|---|---|
 | `sfarchive_stream_last_committed_event_timestamp_seconds{topic}` | Event time covered by the checkpoint. `time() - value` is the replay age. | Warn well inside the Pub/Sub retention window (e.g. > 12h), page before it (e.g. > 24h). |
@@ -61,6 +68,19 @@ from the stream.
 Another collector took over the topic, or Redis was unreachable for longer than the lease TTL.
 The collector stops without moving the checkpoint; the orchestrator restarts it. If it keeps
 happening, look for a second deployment or Redis instability.
+
+Checkpoint commits are retried for two thirds of the lease TTL (20 seconds at the default
+30-second TTL). A cache failover that takes longer, such as an ElastiCache primary replacement,
+stops every topic: the lease cannot be proven held, so continuing would risk two writers. This
+is deliberate. The restarted collectors resume from the last committed checkpoint and re-archive
+at most one batch per topic.
+
+### Stream collector stops with "authentication failed N times in a row"
+
+Five consecutive logins failed, or sessions were rejected before receiving any data, either at
+startup or after the credentials stopped working mid-run (revoked, rotated, or the integration
+user lost Pub/Sub access). Fix the credentials; the checkpoint is untouched, so the restarted
+collector resumes where it stopped.
 
 ### S3 unavailable
 

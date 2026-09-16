@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/davtir78/salesforce-s3-archiver/internal/archive"
 	"github.com/davtir78/salesforce-s3-archiver/internal/checkpoint"
+	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/grpcclient"
 	"github.com/davtir78/salesforce-s3-archiver/internal/integration/stream/pubsub/proto"
 	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 	"github.com/davtir78/salesforce-s3-archiver/internal/metrics"
@@ -27,6 +29,9 @@ const (
 	ReplayLatest   = "LATEST"
 
 	errorCodeAuth = "sfdc.platform.eventbus.grpc.service.auth.error"
+	// Consecutive login failures before the collector gives up. Credentials
+	// that are revoked or wrong will not fix themselves.
+	maxAuthFailures = 5
 	// Salesforce keeps the subscription alive with keepalives within 270s.
 	streamIdleTimeout = 300 * time.Second
 )
@@ -145,6 +150,10 @@ type Subscriber struct {
 
 	buffer      []archive.Record
 	bufferStart time.Time
+	// sessionHealthy is set once a session receives its first response.
+	sessionHealthy bool
+	// authFailures counts consecutive failed logins.
+	authFailures int
 }
 
 func NewSubscriber(opts SubscriberOptions, client Client, sink archive.Sink, store checkpoint.Store) *Subscriber {
@@ -184,6 +193,9 @@ func (s *Subscriber) Run(ctx context.Context) error {
 
 	replay, ok, err := lease.Load(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		metrics.CheckpointFailures.WithLabelValues(s.opts.Topic, "load").Inc()
 		return fatal(fmt.Errorf("loading checkpoint: %w", err))
 	}
@@ -197,10 +209,6 @@ func (s *Subscriber) Run(ctx context.Context) error {
 		s.logger.Warn("No checkpoint found; bootstrapping subscription", "initialReplay", s.opts.InitialReplay)
 	}
 
-	if s.OnActive != nil {
-		s.OnActive(true)
-		defer s.OnActive(false)
-	}
 	metrics.LeaseHeld.WithLabelValues(s.opts.Topic).Set(1)
 	defer metrics.LeaseHeld.WithLabelValues(s.opts.Topic).Set(0)
 
@@ -212,6 +220,10 @@ func (s *Subscriber) Run(ctx context.Context) error {
 	backoff := s.opts.RetryDelay
 	for {
 		err := s.session(ctx, renewErr)
+		healthy := s.sessionHealthy
+		if s.OnActive != nil && healthy {
+			s.OnActive(false)
+		}
 		if ctx.Err() != nil {
 			// Shutting down. A fatal error here means the final flush or commit
 			// failed; report it so the process exits non-zero.
@@ -228,19 +240,44 @@ func (s *Subscriber) Run(ctx context.Context) error {
 			reason = "auth"
 		}
 		metrics.Reconnects.WithLabelValues(s.opts.Topic, reason).Inc()
-		s.logger.Warn("Subscription ended; reconnecting", "error", fmt.Sprint(err), "backoff", backoff.String())
-		if sleepErr := sleep(ctx, backoff); sleepErr != nil {
+		// A session that received data resets the backoff before this sleep, so
+		// the first retry after a long healthy run is fast. A session that ended
+		// on a schema fetch failure does not: it may have been healthy only
+		// until it met an event whose schema cannot be fetched.
+		var schemaErr *grpcclient.SchemaFetchError
+		progressed := healthy && !errors.As(err, &schemaErr)
+		if progressed {
+			backoff = s.opts.RetryDelay
+		}
+		delay := jitter(backoff)
+		s.logger.Warn("Subscription ended; reconnecting", "error", fmt.Sprint(err), "backoff", delay.String())
+		if sleepErr := sleep(ctx, delay); sleepErr != nil {
 			return nil
 		}
-		if err == nil {
-			backoff = s.opts.RetryDelay
-		} else if backoff *= 2; backoff > s.opts.MaxBackoff {
-			backoff = s.opts.MaxBackoff
+		if !progressed {
+			if backoff *= 2; backoff > s.opts.MaxBackoff {
+				backoff = s.opts.MaxBackoff
+			}
 		}
 	}
 }
 
+// jitter spreads retries over [d/2, d) so collectors that fail together (a
+// shared cache or Salesforce outage) do not retry in lockstep.
+func jitter(d time.Duration) time.Duration {
+	if d < 2 {
+		return d
+	}
+	half := d / 2
+	return half + rand.N(half)
+}
+
+// renewLease keeps the lease alive until the subscriber returns. It deliberately
+// outlives ctx: after SIGTERM the final flush may still run for
+// ShutdownFlushTimeout, and losing the lease then would fail its commit and
+// re-archive the batch after restart.
 func (s *Subscriber) renewLease(ctx context.Context, stop <-chan struct{}, out chan<- error) {
+	renewCtx := context.WithoutCancel(ctx)
 	interval := s.opts.LeaseTTL / 3
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -249,10 +286,8 @@ func (s *Subscriber) renewLease(ctx context.Context, stop <-chan struct{}, out c
 		select {
 		case <-stop:
 			return
-		case <-ctx.Done():
-			return
 		case <-ticker.C:
-			err := s.lease.Renew(ctx)
+			err := s.lease.Renew(renewCtx)
 			if err == nil {
 				lastOK = time.Now()
 				continue
@@ -279,10 +314,11 @@ type recvResult struct {
 func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr error) {
 	if s.client.OrgId() == "" {
 		if err := s.client.Authenticate(ctx); err != nil {
-			return fmt.Errorf("authenticating: %w", err)
+			return s.authFailed(fmt.Errorf("authenticating: %w", err))
 		}
 	}
 
+	s.sessionHealthy = false
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := s.client.Subscribe(streamCtx)
@@ -379,11 +415,26 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 				}
 			}
 			idle.Reset(streamIdleTimeout)
+			if !s.sessionHealthy {
+				s.sessionHealthy = true
+				// Only a session that receives data proves the credentials work;
+				// a successful login alone does not (e.g. a user without access).
+				s.authFailures = 0
+				if s.OnActive != nil {
+					s.OnActive(true)
+				}
+			}
 
 			resp := res.resp
 			for _, ev := range resp.GetEvents() {
 				rec, err := s.decode(ctx, ev)
 				if err != nil {
+					var schemaErr *grpcclient.SchemaFetchError
+					if errors.As(err, &schemaErr) {
+						// Could not reach the schema service; the buffer is flushed by
+						// the deferred flush and the session reconnects.
+						return fmt.Errorf("event with replay ID %s: %w", encodeReplay(ev.GetReplayId()), err)
+					}
 					// An undecodable event cannot be skipped without losing it.
 					return fatal(fmt.Errorf("decoding event with replay ID %s: %w", encodeReplay(ev.GetReplayId()), err))
 				}
@@ -401,6 +452,16 @@ func (s *Subscriber) session(ctx context.Context, renewErr <-chan error) (retErr
 				}
 			}
 			metrics.BufferedEvents.WithLabelValues(s.opts.Topic).Set(float64(len(s.buffer)))
+
+			// Until the first commit there is no stored position: a reconnect or
+			// restart would resume at LATEST and skip whatever arrived in between.
+			// Flush the first batch immediately to pin the position.
+			if s.committed == nil && len(s.buffer) > 0 {
+				flushTimer.Stop()
+				if err := flushNow(); err != nil {
+					return err
+				}
+			}
 
 			// Keepalive with outstanding demand: nothing is pending delivery up
 			// to latest_replay_id, so it is safe to move the checkpoint there.
@@ -476,8 +537,19 @@ func (s *Subscriber) classifyStreamError(ctx context.Context, stream proto.PubSu
 	switch {
 	case code == errorCodeAuth || st.Code() == codes.Unauthenticated:
 		s.logger.Warn("Pub/Sub session rejected; re-authenticating", "errorCode", code)
+		if s.sessionHealthy {
+			// Rejected after working (e.g. a token expired): start counting afresh.
+			s.authFailures = 0
+		}
 		if authErr := s.client.Authenticate(ctx); authErr != nil {
-			return fmt.Errorf("re-authenticating: %w", authErr)
+			return s.authFailed(fmt.Errorf("re-authenticating: %w", authErr))
+		}
+		if !s.sessionHealthy {
+			// Login succeeds but the session is rejected before any data: count
+			// it, or a user without Pub/Sub access would retry forever.
+			if fatalErr := s.authFailed(err); IsFatal(fatalErr) {
+				return fatalErr
+			}
 		}
 		return &authError{err}
 	case strings.Contains(strings.ToLower(code), "replayid"):
@@ -487,6 +559,19 @@ func (s *Subscriber) classifyStreamError(ctx context.Context, stream proto.PubSu
 	default:
 		return fmt.Errorf("subscription stream error (error-code %q): %w", code, err)
 	}
+}
+
+// authFailed counts a failed login or rejected session. Consecutive failures
+// before any data arrives are fatal after maxAuthFailures: credentials that were
+// revoked or never worked are an operator problem, and retrying forever would
+// archive nothing while the process keeps running. The count resets when a
+// session receives data.
+func (s *Subscriber) authFailed(err error) error {
+	s.authFailures++
+	if s.authFailures >= maxAuthFailures {
+		return fatal(fmt.Errorf("authentication failed %d times in a row: %w", s.authFailures, err))
+	}
+	return &authError{fmt.Errorf("attempt %d of %d: %w", s.authFailures, maxAuthFailures, err)}
 }
 
 type authError struct{ err error }
@@ -560,8 +645,9 @@ func (s *Subscriber) flush(ctx context.Context) error {
 
 func (s *Subscriber) writeWithRetry(ctx context.Context, meta archive.ObjectMeta, records []archive.Record) error {
 	delay := s.opts.RetryDelay
+	attempts := s.opts.WriteAttempts
 	var lastErr error
-	for attempt := 1; attempt <= s.opts.WriteAttempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		_, err := archive.WriteRecords(ctx, s.sink, meta, records)
 		if err == nil {
 			metrics.ObjectsArchived.WithLabelValues(archive.SourceStream).Inc()
@@ -569,11 +655,11 @@ func (s *Subscriber) writeWithRetry(ctx context.Context, meta archive.ObjectMeta
 		}
 		lastErr = err
 		metrics.UploadFailures.WithLabelValues(archive.SourceStream).Inc()
-		s.logger.Error("Archive write failed", "attempt", attempt, "of", s.opts.WriteAttempts, "events", len(records), "error", err.Error())
-		if attempt == s.opts.WriteAttempts {
+		s.logger.Error("Archive write failed", "attempt", attempt, "of", attempts, "events", len(records), "error", err.Error())
+		if attempt == attempts {
 			break
 		}
-		if sleep(ctx, delay) != nil {
+		if sleep(ctx, jitter(delay)) != nil {
 			break
 		}
 		if delay *= 2; delay > 30*time.Second {
@@ -584,9 +670,22 @@ func (s *Subscriber) writeWithRetry(ctx context.Context, meta archive.ObjectMeta
 	return fatal(fmt.Errorf("archive write failed after retries, checkpoint not advanced: %w", lastErr))
 }
 
+// commitBudget bounds checkpoint retries: long enough to ride out a cache
+// failover, short enough to stay inside the lease.
+func (s *Subscriber) commitBudget() time.Duration {
+	if budget := s.opts.LeaseTTL - s.opts.LeaseTTL/3; budget > 5*time.Second {
+		return budget
+	}
+	return 5 * time.Second
+}
+
+// commit stores the replay ID, retrying within that budget: failing fast would
+// stop every topic and re-archive the batch on restart.
 func (s *Subscriber) commit(ctx context.Context, replayId []byte, newestEvent *time.Time) error {
+	deadline := time.Now().Add(s.commitBudget())
+	delay := s.opts.RetryDelay
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	for attempt := 1; ; attempt++ {
 		err := s.lease.Commit(ctx, replayId)
 		if err == nil {
 			s.committed = append([]byte(nil), replayId...)
@@ -599,11 +698,15 @@ func (s *Subscriber) commit(ctx context.Context, replayId []byte, newestEvent *t
 		}
 		lastErr = err
 		metrics.CheckpointFailures.WithLabelValues(s.opts.Topic, "commit").Inc()
-		if errors.Is(err, checkpoint.ErrLeaseLost) {
+		if errors.Is(err, checkpoint.ErrLeaseLost) || time.Now().After(deadline) {
 			break
 		}
-		if sleep(ctx, s.opts.RetryDelay) != nil {
+		s.logger.Warn("Checkpoint commit failed; retrying", "attempt", attempt, "error", err.Error())
+		if sleep(ctx, jitter(delay)) != nil {
 			break
+		}
+		if delay *= 2; delay > 5*time.Second {
+			delay = 5 * time.Second
 		}
 	}
 	// Data is archived but the checkpoint did not move: a restart re-archives
