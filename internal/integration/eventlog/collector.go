@@ -39,6 +39,7 @@ type FieldMapping = map[string]bool
 type Collector struct {
 	conf  *config.EventLogConfig
 	orgId string
+	env   string
 	db    cache.Cache
 	sink  archive.Sink
 	// Directory for downloaded CSV files (default os.TempDir()).
@@ -46,8 +47,8 @@ type Collector struct {
 	now         func() time.Time
 }
 
-func NewCollector(conf *config.EventLogConfig, orgId string, db cache.Cache, sink archive.Sink) *Collector {
-	return &Collector{conf: conf, orgId: orgId, db: db, sink: sink, now: time.Now}
+func NewCollector(conf *config.EventLogConfig, orgId, env string, db cache.Cache, sink archive.Sink) *Collector {
+	return &Collector{conf: conf, orgId: orgId, env: env, db: db, sink: sink, now: time.Now}
 }
 
 // Poll runs one collection cycle. It returns an error if any part failed; the
@@ -228,6 +229,7 @@ func (c *Collector) archiveLogFile(ctx context.Context, rec *query.EventLogfileR
 	meta := archive.ObjectMeta{
 		Source:        archive.SourceEventLog,
 		OrgId:         c.orgId,
+		Env:           c.env,
 		Instance:      c.conf.Name,
 		EventType:     rec.EventType,
 		PartitionTime: logDate,
@@ -243,7 +245,7 @@ func (c *Collector) archiveLogFile(ctx context.Context, rec *query.EventLogfileR
 	}
 	mapping := c.fieldMapping(rec.EventType)
 	m, err := c.sink.Write(ctx, meta, func(w archive.RecordWriter) error {
-		return streamCsv(path, rec.EventType, mapping, w)
+		return streamCsv(path, rec.Id, rec.EventType, mapping, w)
 	})
 	var malformed *malformedCsvError
 	if errors.As(err, &malformed) {
@@ -276,7 +278,7 @@ func (c *Collector) fieldMapping(eventType string) FieldMapping {
 
 // streamCsv reads a CSV file and writes each row as a record. The file is
 // always closed (the upstream exporter leaked the descriptor).
-func streamCsv(path, eventType string, mapping FieldMapping, w archive.RecordWriter) error {
+func streamCsv(path, fileId, eventType string, mapping FieldMapping, w archive.RecordWriter) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -303,7 +305,7 @@ func streamCsv(path, eventType string, mapping FieldMapping, w archive.RecordWri
 		if err != nil {
 			return &malformedCsvError{line: line, err: err}
 		}
-		if err := w.WriteRecord(buildCsvRecord(labels, row, eventType, mapping)); err != nil {
+		if err := w.WriteRecord(buildCsvRecord(labels, row, fileId, line, eventType, mapping)); err != nil {
 			return err
 		}
 	}
@@ -311,7 +313,7 @@ func streamCsv(path, eventType string, mapping FieldMapping, w archive.RecordWri
 
 // buildCsvRecord keeps every column value as the original string (archival
 // fidelity; the upstream exporter converted numbers and truncated strings).
-func buildCsvRecord(labels, row []string, eventType string, mapping FieldMapping) archive.Record {
+func buildCsvRecord(labels, row []string, fileId string, line int, eventType string, mapping FieldMapping) archive.Record {
 	attrs := make(map[string]any, len(labels))
 	ts := time.Time{}
 	for i, label := range labels {
@@ -338,7 +340,18 @@ func buildCsvRecord(labels, row []string, eventType string, mapping FieldMapping
 	if ts.IsZero() {
 		ts = time.Now()
 	}
-	return archive.Record{Type: eventType, Timestamp: ts.UTC(), Attributes: attrs}
+	return archive.Record{Type: eventType, Id: csvRowId(fileId, line), Timestamp: ts.UTC(), Payload: attrs}
+}
+
+// csvRowId identifies one row of one EventLogFile. Rows have no unique field of
+// their own (REQUEST_ID repeats across the rows of a request), so the file ID
+// and line number are hashed into a stable ID that survives reprocessing.
+func csvRowId(fileId string, line int) string {
+	if fileId == "" {
+		return ""
+	}
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%d", fileId, line))
+	return hex.EncodeToString(sum[:16])
 }
 
 func (c *Collector) queryWatermarkKey(q *config.QueryConfig) string {
@@ -379,6 +392,7 @@ func (c *Collector) collectCustomQuery(ctx context.Context, q *config.QueryConfi
 		meta := archive.ObjectMeta{
 			Source:        archive.SourceSOQL,
 			OrgId:         c.orgId,
+			Env:           c.env,
 			Instance:      c.conf.Name,
 			EventType:     pending[0].Type,
 			PartitionTime: until,
@@ -455,13 +469,17 @@ func buildCustomRecord(row map[string]any, q *config.QueryConfig) archive.Record
 		}
 	}
 	delete(attrs, "attributes")
+	recordId, _ := row["Id"].(string)
+	if recordId == "" {
+		recordId = buildCustomId(row, q)
+	}
 	ts := time.Now()
 	if s, ok := row[q.Timestamp].(string); ok {
 		if t, err := parseSFDate(s); err == nil {
 			ts = t
 		}
 	}
-	return archive.Record{Type: eventType, Timestamp: ts.UTC(), Attributes: attrs}
+	return archive.Record{Type: eventType, Id: recordId, Timestamp: ts.UTC(), Payload: attrs}
 }
 
 func buildCustomId(record map[string]any, customQuery *config.QueryConfig) string {
@@ -492,7 +510,8 @@ func (c *Collector) collectLimits(ctx context.Context) error {
 		records = append(records, archive.Record{
 			Type:      "Limits",
 			Timestamp: now,
-			Attributes: map[string]any{
+			Id:        name + "@" + now.Format(time.RFC3339),
+			Payload: map[string]any{
 				"limitName":      name,
 				"limitMax":       l.Max,
 				"limitRemaining": l.Remaining,
@@ -503,7 +522,7 @@ func (c *Collector) collectLimits(ctx context.Context) error {
 		return nil
 	}
 	_, err = archive.WriteRecords(ctx, c.sink, archive.ObjectMeta{
-		Source: archive.SourceLimits, OrgId: c.orgId, Instance: c.conf.Name, EventType: "Limits", PartitionTime: now,
+		Source: archive.SourceLimits, OrgId: c.orgId, Env: c.env, Instance: c.conf.Name, EventType: "Limits", PartitionTime: now,
 	}, records)
 	if err != nil {
 		metrics.UploadFailures.WithLabelValues(archive.SourceLimits).Inc()

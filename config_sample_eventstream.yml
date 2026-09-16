@@ -1,6 +1,7 @@
 # Sample configuration for sf-archive-stream. Values like $VAR are read from the environment.
 version: "3.0"
 logLevel: info
+env: prod                                # deployment identifier stored in every archived line
 metricsAddr: ":9090"
 # orgId: 00D...   # optional override; discovered from the userinfo endpoint
 

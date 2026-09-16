@@ -71,7 +71,7 @@ func (c *Collector) handleMalformed(ctx context.Context, rec *query.EventLogfile
 	qmeta.Lineage["attempts"] = strconv.Itoa(attempts)
 
 	m, err := c.sink.Write(ctx, qmeta, func(w archive.RecordWriter) error {
-		return streamRawLines(path, rec.EventType, cause, w)
+		return streamRawLines(path, rec.Id, rec.EventType, cause, w)
 	})
 	if err != nil {
 		return fmt.Errorf("quarantining malformed EventLogFile %s: %w", rec.Id, err)
@@ -86,7 +86,7 @@ func (c *Collector) handleMalformed(ctx context.Context, rec *query.EventLogfile
 }
 
 // streamRawLines archives every physical line of the file unparsed.
-func streamRawLines(path, eventType string, cause *malformedCsvError, w archive.RecordWriter) error {
+func streamRawLines(path, fileId, eventType string, cause *malformedCsvError, w archive.RecordWriter) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -99,8 +99,9 @@ func streamRawLines(path, eventType string, cause *malformedCsvError, w archive.
 		if len(line) > 0 {
 			rec := archive.Record{
 				Type:      eventType,
+				Id:        csvRowId(fileId, n),
 				Timestamp: now,
-				Attributes: map[string]any{
+				Payload: map[string]any{
 					"quarantined":      true,
 					"lineNumber":       n,
 					"rawLine":          line,

@@ -202,6 +202,9 @@ type Config struct {
 	Archive     ArchiveConfig      `mapstructure:"archive"`
 	// Organisation ID override; normally discovered from the userinfo endpoint.
 	OrgId string `mapstructure:"orgId"`
+	// Env identifies the deployment that collected the data (e.g. "prod",
+	// "test"). Stored in every archived line as env.
+	Env string `mapstructure:"env"`
 	// Address for the /metrics and /healthz HTTP server, e.g. ":9090". Empty disables it.
 	MetricsAddr string `mapstructure:"metricsAddr"`
 	LogLevel    string `mapstructure:"logLevel"`

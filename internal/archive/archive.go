@@ -31,18 +31,24 @@ var CollectorVersion = "dev"
 
 // Record is one archived event, log line or query row.
 type Record struct {
-	Type       string
-	Timestamp  time.Time
-	Attributes map[string]any
+	Type      string
+	Timestamp time.Time
+	// Id uniquely identifies this record within its source, for downstream
+	// de-duplication. Empty when the source has no usable identifier.
+	Id string
+	// Payload is the source record, unchanged.
+	Payload map[string]any
 	// Opaque Pub/Sub replay ID, streams only.
 	ReplayId []byte
 }
 
 // ObjectMeta describes the object being written.
 type ObjectMeta struct {
-	Source    string
-	OrgId     string
-	Instance  string
+	Source   string
+	OrgId    string
+	Instance string
+	// Env identifies the deployment that collected the data (e.g. "prod").
+	Env       string
 	EventType string
 	// Time used for the year/month/day/hour partition.
 	PartitionTime time.Time

@@ -128,3 +128,14 @@ func (s *MemorySink) Lines() ([]Line, error) {
 
 // ErrInjected is returned by fault hooks in tests.
 var ErrInjected = errors.New("injected fault")
+
+// Objects returns the stored object bodies by key (tests).
+func (s *MemorySink) Objects() map[string][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]byte, len(s.objects))
+	for k, v := range s.objects {
+		out[k] = append([]byte(nil), v...)
+	}
+	return out
+}

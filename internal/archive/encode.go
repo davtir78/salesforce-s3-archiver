@@ -16,15 +16,18 @@ import (
 	"time"
 )
 
-// Line is the JSON shape of one NDJSON line in a data object.
+// Line is the JSON shape of one NDJSON line in a data object: a small envelope
+// around the unchanged source record in Payload.
 type Line struct {
-	EventType  string         `json:"eventType"`
-	Timestamp  time.Time      `json:"timestamp"`
-	ReplayId   string         `json:"replayId,omitempty"`
-	OrgId      string         `json:"orgId,omitempty"`
-	Instance   string         `json:"instance,omitempty"`
-	Source     string         `json:"source"`
-	Attributes map[string]any `json:"attributes"`
+	EventId   string         `json:"event_id,omitempty"`
+	EventType string         `json:"event_type"`
+	Timestamp time.Time      `json:"timestamp"`
+	Source    string         `json:"source"`
+	Env       string         `json:"env,omitempty"`
+	OrgId     string         `json:"org_id,omitempty"`
+	Instance  string         `json:"instance,omitempty"`
+	ReplayId  string         `json:"replay_id,omitempty"`
+	Payload   map[string]any `json:"payload"`
 }
 
 type countingWriter struct {
@@ -70,15 +73,17 @@ func newEncoder(meta ObjectMeta) (*encoder, error) {
 
 func (e *encoder) WriteRecord(r Record) error {
 	line := Line{
-		EventType:  r.Type,
-		Timestamp:  r.Timestamp.UTC(),
-		OrgId:      e.meta.OrgId,
-		Instance:   e.meta.Instance,
-		Source:     e.meta.Source,
-		Attributes: r.Attributes,
+		EventId:   r.Id,
+		EventType: r.Type,
+		Timestamp: r.Timestamp.UTC(),
+		Source:    e.meta.Source,
+		Env:       e.meta.Env,
+		OrgId:     e.meta.OrgId,
+		Instance:  e.meta.Instance,
+		Payload:   r.Payload,
 	}
-	if line.Attributes == nil {
-		line.Attributes = map[string]any{}
+	if line.Payload == nil {
+		line.Payload = map[string]any{}
 	}
 	if len(r.ReplayId) > 0 {
 		line.ReplayId = base64.StdEncoding.EncodeToString(r.ReplayId)

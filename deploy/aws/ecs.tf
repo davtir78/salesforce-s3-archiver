@@ -57,6 +57,7 @@ locals {
   stream_config = <<-YAML
     version: "3.0"
     logLevel: info
+    env: ${var.name}-run${var.run_id}
     metricsAddr: ":9090"
     eventStream:
       instanceName: ${local.instance}
@@ -96,6 +97,7 @@ locals {
   eventlog_config = <<-YAML
     version: "3.0"
     logLevel: info
+    env: ${var.name}-run${var.run_id}
     metricsAddr: ":9090"
     eventLog:
       instanceName: ${local.instance}

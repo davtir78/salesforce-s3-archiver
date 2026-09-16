@@ -52,7 +52,7 @@ func newELFHarness(t *testing.T, opts mocksf.Options) *elfHarness {
 	}
 	db := cache.NewMemoryCache()
 	sink := archive.NewMemorySink()
-	c := NewCollector(conf, o.OrgId, db, sink)
+	c := NewCollector(conf, o.OrgId, "test-env", db, sink)
 	c.DownloadDir = t.TempDir()
 	return &elfHarness{t: t, mock: mock, conf: conf, db: db, sink: sink, c: c, dlDir: c.DownloadDir}
 }
@@ -65,7 +65,7 @@ func (h *elfHarness) archivedRequestIds() map[string]int {
 	counts := map[string]int{}
 	for _, l := range lines {
 		if l.Source == archive.SourceEventLog {
-			id, _ := l.Attributes["REQUEST_ID"].(string)
+			id, _ := l.Payload["REQUEST_ID"].(string)
 			counts[id]++
 		}
 	}
@@ -118,10 +118,10 @@ func TestArchivesEventLogFilesAcrossPages(t *testing.T) {
 		}
 	}
 	lines, _ := h.sink.Lines()
-	if v := lines[0].Attributes["LOGIN_TYPE"]; v != `Application, with "quotes"` {
+	if v := lines[0].Payload["LOGIN_TYPE"]; v != `Application, with "quotes"` {
 		t.Errorf("CSV quoting not preserved: %q", v)
 	}
-	if _, ok := lines[0].Attributes["RUN_TIME"].(string); !ok {
+	if _, ok := lines[0].Payload["RUN_TIME"].(string); !ok {
 		t.Errorf("values must be kept as original strings")
 	}
 	h.assertNoTempFiles()
@@ -223,7 +223,7 @@ func TestCsvFilesAreClosed(t *testing.T) {
 	// streamCsv closes the file even when the writer fails mid-file.
 	path := filepath.Join(t.TempDir(), "x.csv")
 	os.WriteFile(path, []byte("EVENT_TYPE,REQUEST_ID\nLogin,a\nLogin,b\n"), 0o600)
-	err := streamCsv(path, "Login", nil, failingWriter{})
+	err := streamCsv(path, "0AT1", "Login", nil, failingWriter{})
 	if err == nil {
 		t.Fatal("expected writer error")
 	}
@@ -250,7 +250,7 @@ func openFileCount() int {
 func TestMalformedCsvFailsTheFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.csv")
 	os.WriteFile(path, []byte("EVENT_TYPE,REQUEST_ID\nLogin,a,extra\n"), 0o600)
-	if err := streamCsv(path, "Login", nil, recordCollector(func(archive.Record) {})); err == nil {
+	if err := streamCsv(path, "0AT1", "Login", nil, recordCollector(func(archive.Record) {})); err == nil {
 		t.Errorf("rows with the wrong field count must fail rather than be skipped")
 	}
 }
@@ -274,7 +274,7 @@ func TestCustomQueriesPaginateDedupeAndRetry(t *testing.T) {
 		lines, _ := h.sink.Lines()
 		m := map[string]int{}
 		for _, l := range lines {
-			id, _ := l.Attributes["Id"].(string)
+			id, _ := l.Payload["Id"].(string)
 			m[id]++
 		}
 		return m, len(lines)
@@ -314,7 +314,7 @@ func TestCustomQueriesPaginateDedupeAndRetry(t *testing.T) {
 		t.Errorf("expected 16 unique rows after recovery, got %d unique / %d lines", len(ids), total)
 	}
 	lines, _ := h.sink.Lines()
-	if _, ok := lines[0].Attributes["attributes"]; ok {
+	if _, ok := lines[0].Payload["attributes"]; ok {
 		t.Errorf("salesforce 'attributes' metadata should be removed")
 	}
 }
@@ -328,7 +328,7 @@ func TestLimitsArchived(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines, _ := h.sink.Lines()
-	if len(lines) != 1 || lines[0].Source != archive.SourceLimits || lines[0].Attributes["limitName"] != "DailyApiRequests" {
+	if len(lines) != 1 || lines[0].Source != archive.SourceLimits || lines[0].Payload["limitName"] != "DailyApiRequests" {
 		t.Errorf("unexpected limits output: %+v", lines)
 	}
 }
@@ -338,7 +338,7 @@ func TestBuildCsvRecordFromSample(t *testing.T) {
 	path := filepath.Join(filepath.Dir(filename), "testdata", "login_logs_sample.csv")
 	var records []archive.Record
 	w := recordCollector(func(r archive.Record) { records = append(records, r) })
-	if err := streamCsv(path, "Login", nil, w); err != nil {
+	if err := streamCsv(path, "0AT1", "Login", nil, w); err != nil {
 		t.Fatal(err)
 	}
 	if len(records) != 9 {
@@ -349,17 +349,17 @@ func TestBuildCsvRecordFromSample(t *testing.T) {
 	if !r.Timestamp.Equal(want) || r.Type != "Login" {
 		t.Errorf("timestamp/type = %v %s", r.Timestamp, r.Type)
 	}
-	if r.Attributes["URI"] != "/services/oauth2/token" || r.Attributes["RUN_TIME"] != "157" || len(r.Attributes) != 34 {
-		t.Errorf("unexpected attributes (%d): %v", len(r.Attributes), r.Attributes)
+	if r.Payload["URI"] != "/services/oauth2/token" || r.Payload["RUN_TIME"] != "157" || len(r.Payload) != 34 {
+		t.Errorf("unexpected attributes (%d): %v", len(r.Payload), r.Payload)
 	}
 
 	// Field mapping keeps mapped fields plus identifying columns.
 	records = nil
-	if err := streamCsv(path, "Login", FieldMapping{"URI": true}, w); err != nil {
+	if err := streamCsv(path, "0AT1", "Login", FieldMapping{"URI": true}, w); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(records[0].Attributes); got != 4 {
-		t.Errorf("mapped record should have URI, EVENT_TYPE, TIMESTAMP, REQUEST_ID; got %v", records[0].Attributes)
+	if got := len(records[0].Payload); got != 4 {
+		t.Errorf("mapped record should have URI, EVENT_TYPE, TIMESTAMP, REQUEST_ID; got %v", records[0].Payload)
 	}
 }
 
@@ -466,7 +466,7 @@ func TestSoqlLargeNumbersAreExact(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("expected one row, got %d", len(lines))
 	}
-	if got := fmt.Sprint(lines[0].Attributes["BigNumber"]); got != "9007199254740993" {
+	if got := fmt.Sprint(lines[0].Payload["BigNumber"]); got != "9007199254740993" {
 		t.Errorf("BigNumber = %s, want 9007199254740993 (float64 would round it)", got)
 	}
 }
