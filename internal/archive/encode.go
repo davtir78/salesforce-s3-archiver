@@ -52,8 +52,7 @@ type encoder struct {
 	buf        *bufio.Writer
 	enc        *json.Encoder
 	count      int64
-	first      *time.Time
-	last       *time.Time
+	times      TimestampRange
 }
 
 func newEncoder(meta ObjectMeta) (*encoder, error) {
@@ -92,16 +91,31 @@ func (e *encoder) WriteRecord(r Record) error {
 		return fmt.Errorf("encoding record: %w", err)
 	}
 	e.count++
-	ts := line.Timestamp
-	if e.first == nil || ts.Before(*e.first) {
-		t := ts
-		e.first = &t
-	}
-	if e.last == nil || ts.After(*e.last) {
-		t := ts
-		e.last = &t
-	}
+	e.times.Add(line.Timestamp)
 	return nil
+}
+
+// TimestampRange is the first and last record timestamp in an object, as
+// recorded in its manifest. The writer and the verifier both use it, so they
+// cannot disagree about which records count.
+type TimestampRange struct {
+	First, Last *time.Time
+}
+
+// Add includes ts in the range. Zero timestamps are ignored: they would make
+// the range start at year 1.
+func (r *TimestampRange) Add(ts time.Time) {
+	if ts.IsZero() {
+		return
+	}
+	if r.First == nil || ts.Before(*r.First) {
+		t := ts
+		r.First = &t
+	}
+	if r.Last == nil || ts.After(*r.Last) {
+		t := ts
+		r.Last = &t
+	}
 }
 
 // finish flushes and closes the compressed stream, rewinds the file and
@@ -131,8 +145,8 @@ func (e *encoder) finish() (Manifest, error) {
 		UncompressedBytes: e.raw.n,
 		CompressedBytes:   e.compressed.n,
 		SHA256:            hex.EncodeToString(e.hasher.Sum(nil)),
-		FirstTimestamp:    e.first,
-		LastTimestamp:     e.last,
+		FirstTimestamp:    e.times.First,
+		LastTimestamp:     e.times.Last,
 		Lineage:           e.meta.Lineage,
 	}, nil
 }
@@ -183,24 +197,43 @@ func encodeObject(
 
 // DecodeObject reads a gzip NDJSON data object.
 func DecodeObject(r io.Reader, fn func(Line) error) error {
+	_, err := DecodeObjectCounted(r, fn)
+	return err
+}
+
+// DecodeObjectCounted is DecodeObject plus the uncompressed byte count, so
+// verification can check a manifest without buffering the whole object.
+func DecodeObjectCounted(r io.Reader, fn func(Line) error) (int64, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer gz.Close()
-	dec := json.NewDecoder(bufio.NewReader(gz))
+	counter := &countingReader{r: gz}
+	dec := json.NewDecoder(bufio.NewReader(counter))
 	dec.UseNumber()
 	for {
 		var line Line
 		err := dec.Decode(&line)
 		if err == io.EOF {
-			return nil
+			return counter.n, nil
 		}
 		if err != nil {
-			return err
+			return counter.n, err
 		}
 		if err := fn(line); err != nil {
-			return err
+			return counter.n, err
 		}
 	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }

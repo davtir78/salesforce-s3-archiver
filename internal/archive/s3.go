@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/davtir78/salesforce-s3-archiver/internal/log"
 )
 
 type S3Options struct {
@@ -27,8 +28,8 @@ type S3Options struct {
 	KmsKeyId       string
 	StorageClass   string
 	MaxAttempts    int
-	// Timeout for each upload attempt (data object or manifest). A hung
-	// connection otherwise blocks the collector indefinitely. Default 5m.
+	// Total timeout for one upload call, including the SDK retries inside it.
+	// Without it a hung connection blocks the collector indefinitely. Default 5m.
 	UploadTimeout time.Duration
 }
 
@@ -76,6 +77,9 @@ func NewS3Sink(ctx context.Context, opts S3Options) (*S3Sink, error) {
 		uploader: manager.NewUploader(client, func(u *manager.Uploader) {
 			u.PartSize = 16 * 1024 * 1024
 			u.Concurrency = 4
+			// The manager aborts with the (already expired) upload context, so
+			// abort here instead, with a context that survives the timeout.
+			u.LeavePartsOnError = true
 		}),
 	}, nil
 }
@@ -131,10 +135,34 @@ func (s *S3Sink) put(ctx context.Context, key string, body io.Reader, contentTyp
 	if s.opts.StorageClass != "" {
 		input.StorageClass = types.StorageClass(s.opts.StorageClass)
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.opts.UploadTimeout)
+	uploadCtx, cancel := context.WithTimeout(ctx, s.opts.UploadTimeout)
 	defer cancel()
-	_, err := s.uploader.Upload(ctx, input)
+	_, err := s.uploader.Upload(uploadCtx, input)
+	if err != nil {
+		s.abortMultipart(ctx, key, err)
+	}
 	return err
+}
+
+// abortMultipart cleans up a failed multipart upload so its parts are not
+// billed indefinitely. It uses a fresh context because the upload context is
+// typically the one that just expired.
+func (s *S3Sink) abortMultipart(ctx context.Context, key string, cause error) {
+	var mu manager.MultiUploadFailure
+	if !errors.As(cause, &mu) || mu.UploadID() == "" {
+		return
+	}
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	_, err := s.client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s.opts.Bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(mu.UploadID()),
+	})
+	if err != nil {
+		log.Warnf("Could not abort multipart upload %s for s3://%s/%s: %v (an AbortIncompleteMultipartUpload lifecycle rule will clean it up)",
+			mu.UploadID(), s.opts.Bucket, key, err)
+	}
 }
 
 func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }

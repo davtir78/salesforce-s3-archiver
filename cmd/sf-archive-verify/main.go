@@ -1,9 +1,11 @@
 // sf-archive-verify reconciles an S3 archive.
 //
-// It checks every manifest against its data object (record count, size and
-// SHA-256) and, when a mock Salesforce ledger URL is given, reports events the
-// mock generated that are missing from the archive. Exit code 0 means no
-// missing records and no manifest mismatches.
+// It streams every data object, checking it against its manifest (record
+// count, compressed and uncompressed size, SHA-256) and reporting manifests
+// whose data object is missing. With -ledger it also reconciles the archived
+// records against the mock Salesforce ledger.
+//
+// Exit code 0 means nothing is missing and every manifest matches.
 package main
 
 import (
@@ -11,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -28,15 +31,22 @@ import (
 )
 
 type report struct {
-	Objects            int            `json:"objects"`
-	Manifests          int            `json:"manifests"`
-	ManifestMismatches []string       `json:"manifestMismatches"`
-	ObjectsWithoutMan  int            `json:"objectsWithoutManifest"`
-	RecordsBySource    map[string]int `json:"recordsBySource"`
-	Streams            map[string]gap `json:"streams,omitempty"`
-	EventLogRows       *gap           `json:"eventLogRows,omitempty"`
-	CustomRecords      map[string]gap `json:"customRecords,omitempty"`
-	OK                 bool           `json:"ok"`
+	Objects            int      `json:"objects"`
+	Manifests          int      `json:"manifests"`
+	ManifestMismatches []string `json:"manifestMismatches"`
+	ManifestsNoObject  []string `json:"manifestsWithoutObject"`
+	ObjectsWithoutMan  int      `json:"objectsWithoutManifest"`
+	UnreadableObjects  []string `json:"unreadableObjects"`
+	// Manifests that could not be read or parsed.
+	UnreadableManifests []string `json:"unreadableManifests"`
+	// Manifests in a format this verifier does not read (e.g. written before
+	// the record envelope); their objects are not decoded.
+	UnsupportedManifests []string       `json:"unsupportedManifests"`
+	RecordsBySource      map[string]int `json:"recordsBySource"`
+	Streams              map[string]gap `json:"streams,omitempty"`
+	EventLogRows         *gap           `json:"eventLogRows,omitempty"`
+	CustomRecords        map[string]gap `json:"customRecords,omitempty"`
+	OK                   bool           `json:"ok"`
 }
 
 type gap struct {
@@ -54,6 +64,8 @@ func main() {
 	region := flag.String("region", "", "AWS region")
 	strict := flag.Bool("strict", false, "also fail on data objects without a manifest (normally duplicates left by a failed manifest upload that the collector re-archived)")
 	ledgerURL := flag.String("ledger", "", "mock Salesforce ledger URL, e.g. http://localhost:8080/admin/ledger")
+	workers := flag.Int("workers", 8, "objects and manifests read concurrently")
+	timeout := flag.Duration("timeout", 0, "give up after this long, e.g. 2h (default: no limit)")
 	out := flag.String("out", "", "write the JSON report to this file")
 	flag.Parse()
 	if *bucket == "" {
@@ -61,7 +73,15 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	if *workers < 1 {
+		*workers = 1
+	}
+	// No deadline by default: a large archive can take hours, and a deadline
+	// that expires mid-run would report every remaining object as unreadable.
+	ctx, cancel := context.Background(), context.CancelFunc(func() {})
+	if *timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), *timeout)
+	}
 	defer cancel()
 
 	sink, err := archive.NewS3Sink(ctx, archive.S3Options{Bucket: *bucket, Prefix: *prefix, Endpoint: *endpoint, ForcePathStyle: *endpoint != "", Region: *region})
@@ -84,20 +104,59 @@ func main() {
 	}
 
 	rep := report{Objects: len(dataKeys), Manifests: len(manifestKeys), RecordsBySource: map[string]int{}}
+	// Fetch manifests concurrently, then process them in listing order so
+	// duplicate detection is deterministic.
+	fetched := make([]archive.Manifest, len(manifestKeys))
+	fetchErrs := make([]error, len(manifestKeys))
+	var fetchWG sync.WaitGroup
+	fetchSem := make(chan struct{}, *workers)
+	for i, k := range manifestKeys {
+		fetchWG.Add(1)
+		fetchSem <- struct{}{}
+		go func() {
+			defer fetchWG.Done()
+			defer func() { <-fetchSem }()
+			fetchErrs[i] = getJSON(ctx, client, *bucket, k, &fetched[i])
+		}()
+	}
+	fetchWG.Wait()
+	checkDeadline(ctx)
+
 	manifests := map[string]archive.Manifest{}
-	for _, k := range manifestKeys {
-		var m archive.Manifest
-		if err := getJSON(ctx, client, *bucket, k, &m); err != nil {
-			fail(err)
+	for i, k := range manifestKeys {
+		m := fetched[i]
+		if err := fetchErrs[i]; err != nil {
+			// Report it and keep going; one corrupt manifest must not hide the rest.
+			rep.UnreadableManifests = append(rep.UnreadableManifests, fmt.Sprintf("%s: %v", k, err))
+			continue
+		}
+		if m.ObjectKey == "" {
+			rep.ManifestMismatches = append(rep.ManifestMismatches, k+" (manifest has no objectKey)")
+			continue
+		}
+		if _, dup := manifests[m.ObjectKey]; dup {
+			rep.ManifestMismatches = append(rep.ManifestMismatches, k+" (duplicate objectKey "+m.ObjectKey+")")
+			continue
+		}
+		if m.ManifestVersion != archive.ManifestVersion {
+			// Earlier line formats do not decode as envelopes; comparing them
+			// would report every record missing rather than the real cause.
+			rep.UnsupportedManifests = append(rep.UnsupportedManifests,
+				fmt.Sprintf("%s (manifestVersion %d, this verifier reads %d)", k, m.ManifestVersion, archive.ManifestVersion))
 		}
 		manifests[m.ObjectKey] = m
 	}
 
-	// Identifiers seen per stream topic / event log / custom object.
-	var mu sync.Mutex
-	streamIds := map[string]map[string]int{}
-	elfIds := map[string]int{}
-	customIds := map[string]map[string]int{}
+	// Record identifiers are only kept when reconciling against a ledger, and
+	// then only the identifier, not the record.
+	reconcile := *ledgerURL != ""
+	var (
+		mu           sync.Mutex
+		seenManifest = map[string]bool{}
+		streamIds    = map[string]map[string]int{}
+		elfIds       = map[string]int{}
+		customIds    = map[string]map[string]int{}
+	)
 	add := func(m map[string]map[string]int, group, id string) {
 		if m[group] == nil {
 			m[group] = map[string]int{}
@@ -105,70 +164,81 @@ func main() {
 		m[group][id]++
 	}
 
-	sem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, *workers)
 	for _, key := range dataKeys {
+		m, hasManifest := manifests[key] // manifests is read-only from here on
+		if hasManifest && m.ManifestVersion != archive.ManifestVersion {
+			mu.Lock()
+			seenManifest[key] = true // already reported as unsupported
+			mu.Unlock()
+			continue
+		}
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(key string) {
+		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			obj, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(*bucket), Key: aws.String(key)})
-			if err != nil {
-				fail(err)
-			}
-			body, err := io.ReadAll(obj.Body)
-			obj.Body.Close()
-			if err != nil {
-				fail(err)
-			}
-			sum := sha256.Sum256(body)
-			var count int64
-			local := []archive.Line{}
-			if err := archive.DecodeObject(strings.NewReader(string(body)), func(l archive.Line) error {
-				count++
-				local = append(local, l)
-				return nil
-			}); err != nil {
-				fail(fmt.Errorf("%s: %w", key, err))
-			}
+			bySource := map[string]int{}
+			var refs []recordRef
+			stats, err := readObject(ctx, client, *bucket, key, func(l archive.Line) {
+				bySource[l.Source]++
+				if reconcile {
+					refs = append(refs, refFor(l, m.Lineage["topic"]))
+				}
+			})
 
 			mu.Lock()
 			defer mu.Unlock()
-			m, ok := manifests[key]
-			if !ok {
-				rep.ObjectsWithoutMan++
-			} else if m.RecordCount != count || m.SHA256 != hex.EncodeToString(sum[:]) || m.CompressedBytes != int64(len(body)) {
-				rep.ManifestMismatches = append(rep.ManifestMismatches, key)
+			if hasManifest {
+				// Reported once: as unreadable or mismatched, never also as a
+				// manifest without an object.
+				seenManifest[key] = true
 			}
-			for _, l := range local {
-				rep.RecordsBySource[l.Source]++
-				switch l.Source {
+			if err != nil {
+				// One unreadable object must not abandon the whole report.
+				rep.UnreadableObjects = append(rep.UnreadableObjects, fmt.Sprintf("%s: %v", key, err))
+				return
+			}
+			if !hasManifest {
+				rep.ObjectsWithoutMan++
+			} else if why := stats.compare(m); why != "" {
+				rep.ManifestMismatches = append(rep.ManifestMismatches, key+" ("+why+")")
+			}
+			for source, n := range bySource {
+				rep.RecordsBySource[source] += n
+			}
+			for _, r := range refs {
+				switch r.source {
 				case archive.SourceStream:
-					topic := ""
-					if ok {
-						topic = m.Lineage["topic"]
-					}
-					// Reconciliation matches the mock ledger, which tracks
-					// EventIdentifier; event_id carries EventUuid.
-					id, _ := l.Payload["EventIdentifier"].(string)
-					add(streamIds, topic, id)
+					add(streamIds, r.group, r.id)
 				case archive.SourceEventLog:
-					id, _ := l.Payload["REQUEST_ID"].(string)
-					elfIds[id]++
+					elfIds[r.id]++
 				case archive.SourceSOQL:
-					id, _ := l.Payload["Id"].(string)
-					add(customIds, l.EventType, id)
+					add(customIds, r.group, r.id)
 				}
 			}
-		}(key)
+		}()
 	}
 	wg.Wait()
+	checkDeadline(ctx)
 
-	// A data object without a manifest is left behind when the manifest upload
-	// fails; the collector did not advance its checkpoint and re-archived the
-	// batch under a new name. Missing records are caught by the ledger check.
-	rep.OK = len(rep.ManifestMismatches) == 0 && (!*strict || rep.ObjectsWithoutMan == 0)
+	for key := range manifests {
+		if !seenManifest[key] {
+			rep.ManifestsNoObject = append(rep.ManifestsNoObject, key)
+		}
+	}
+	for _, list := range [][]string{rep.ManifestsNoObject, rep.ManifestMismatches, rep.UnreadableObjects, rep.UnreadableManifests, rep.UnsupportedManifests} {
+		sort.Strings(list)
+	}
+
+	rep.OK = len(rep.ManifestMismatches) == 0 &&
+		len(rep.ManifestsNoObject) == 0 &&
+		len(rep.UnreadableObjects) == 0 &&
+		len(rep.UnreadableManifests) == 0 &&
+		len(rep.UnsupportedManifests) == 0 &&
+		(!*strict || rep.ObjectsWithoutMan == 0)
+
 	if *ledgerURL != "" {
 		var ledger mocksf.Ledger
 		if err := fetchJSON(*ledgerURL, &ledger); err != nil {
@@ -203,6 +273,100 @@ func main() {
 	if !rep.OK {
 		os.Exit(1)
 	}
+}
+
+// objectStats is what a data object actually contains.
+type objectStats struct {
+	records      int64
+	compressed   int64
+	uncompressed int64
+	sha256       string
+	first, last  *time.Time
+}
+
+func (s objectStats) compare(m archive.Manifest) string {
+	var problems []string
+	if s.records != m.RecordCount {
+		problems = append(problems, fmt.Sprintf("record count %d != manifest %d", s.records, m.RecordCount))
+	}
+	if s.compressed != m.CompressedBytes {
+		problems = append(problems, fmt.Sprintf("compressed bytes %d != manifest %d", s.compressed, m.CompressedBytes))
+	}
+	if s.uncompressed != m.UncompressedBytes {
+		problems = append(problems, fmt.Sprintf("uncompressed bytes %d != manifest %d", s.uncompressed, m.UncompressedBytes))
+	}
+	if s.sha256 != m.SHA256 {
+		problems = append(problems, "sha256 mismatch")
+	}
+	if !sameTime(s.first, m.FirstTimestamp) || !sameTime(s.last, m.LastTimestamp) {
+		problems = append(problems, "first/last timestamp mismatch")
+	}
+	return strings.Join(problems, "; ")
+}
+
+func sameTime(a, b *time.Time) bool {
+	switch {
+	case a == nil && b == nil:
+		return true
+	case a == nil || b == nil:
+		return false
+	default:
+		return a.Equal(*b)
+	}
+}
+
+// readObject streams a data object from S3 through scanObject.
+func readObject(ctx context.Context, client *s3.Client, bucket, key string, visit func(archive.Line)) (objectStats, error) {
+	obj, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	if err != nil {
+		return objectStats{}, err
+	}
+	defer obj.Body.Close()
+	return scanObject(obj.Body, visit)
+}
+
+// scanObject reads the object once, hashing and counting the compressed bytes
+// while decoding the NDJSON. Each record is passed to visit and then dropped, so
+// memory does not grow with the object.
+func scanObject(r io.Reader, visit func(archive.Line)) (objectStats, error) {
+	hasher := sha256.New()
+	counter := &countingReader{r: io.TeeReader(r, hasher)}
+	var (
+		stats objectStats
+		times archive.TimestampRange
+	)
+	uncompressed, err := archive.DecodeObjectCounted(counter, func(l archive.Line) error {
+		stats.records++
+		times.Add(l.Timestamp)
+		if visit != nil {
+			visit(l)
+		}
+		return nil
+	})
+	if err != nil {
+		return objectStats{}, err
+	}
+	// Drain any trailer the gzip reader left so the byte count and hash cover
+	// the whole object.
+	if _, err := io.Copy(io.Discard, counter); err != nil {
+		return objectStats{}, err
+	}
+	stats.first, stats.last = times.First, times.Last
+	stats.compressed = counter.n
+	stats.uncompressed = uncompressed
+	stats.sha256 = hex.EncodeToString(hasher.Sum(nil))
+	return stats, nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func compare(expected []string, seen map[string]int) gap {
@@ -260,7 +424,37 @@ func fetchJSON(url string, v any) error {
 	return json.NewDecoder(resp.Body).Decode(v)
 }
 
+// checkDeadline stops with exit code 2 if -timeout expired: the per-object
+// failures that follow an expired context say nothing about the archive.
+func checkDeadline(ctx context.Context) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		fail(fmt.Errorf("verification did not finish within -timeout; the report would be incomplete: %w", ctx.Err()))
+	}
+}
+
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 	os.Exit(2)
+}
+
+// recordRef is the part of a record the ledger reconciliation needs.
+type recordRef struct {
+	source, group, id string
+}
+
+// refFor extracts the identifier the mock ledger tracks for each source.
+func refFor(l archive.Line, topic string) recordRef {
+	switch l.Source {
+	case archive.SourceStream:
+		// The mock ledger tracks EventIdentifier; event_id is EventUuid.
+		id, _ := l.Payload["EventIdentifier"].(string)
+		return recordRef{l.Source, topic, id}
+	case archive.SourceEventLog:
+		id, _ := l.Payload["REQUEST_ID"].(string)
+		return recordRef{l.Source, "", id}
+	case archive.SourceSOQL:
+		id, _ := l.Payload["Id"].(string)
+		return recordRef{l.Source, l.EventType, id}
+	}
+	return recordRef{source: l.Source}
 }

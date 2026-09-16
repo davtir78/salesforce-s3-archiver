@@ -9,6 +9,7 @@ package archive
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"regexp"
@@ -108,12 +109,20 @@ func WriteRecords(ctx context.Context, sink Sink, meta ObjectMeta, records []Rec
 
 var unsafeKeyChars = regexp.MustCompile(`[^A-Za-z0-9_.\-]`)
 
+// sanitize makes a value safe for an S3 key. When characters had to be
+// replaced a short hash is appended, so "Login Event" and "Login/Event" do not
+// collapse into the same partition.
 func sanitize(s, fallback string) string {
-	s = unsafeKeyChars.ReplaceAllString(strings.TrimSpace(s), "_")
-	if s == "" {
+	trimmed := strings.TrimSpace(s)
+	clean := unsafeKeyChars.ReplaceAllString(trimmed, "_")
+	if clean == "" {
 		return fallback
 	}
-	return s
+	if clean != trimmed {
+		sum := sha256.Sum256([]byte(trimmed))
+		clean += "-" + hex.EncodeToString(sum[:3])
+	}
+	return clean
 }
 
 // UniqueName returns a collision-resistant object name.

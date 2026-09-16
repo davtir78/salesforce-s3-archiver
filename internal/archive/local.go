@@ -25,6 +25,9 @@ func NewLocalSink(dir, prefix string) (*LocalSink, error) {
 
 func (s *LocalSink) Write(ctx context.Context, meta ObjectMeta, fill func(w RecordWriter) error) (Manifest, error) {
 	return encodeObject(ctx, meta, fill, func(ctx context.Context, body *os.File, m *Manifest) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		name := meta.Name
 		if name == "" {
 			name = UniqueName(m.IngestedAt)
@@ -34,7 +37,7 @@ func (s *LocalSink) Write(ctx context.Context, meta ObjectMeta, fill func(w Reco
 		manifestKey = joinPrefix(s.Prefix, manifestKey)
 		m.ObjectKey = dataKey
 
-		if err := s.atomicWrite(dataKey, body); err != nil {
+		if err := s.atomicWrite(dataKey, ctxReader{ctx, body}); err != nil {
 			return fmt.Errorf("writing data object: %w", err)
 		}
 		mb, err := json.MarshalIndent(m, "", "  ")
@@ -69,9 +72,28 @@ func (s *LocalSink) atomicWrite(key string, r io.Reader) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	// Without an fsync of the directory the rename can be lost in a crash,
+	// while Write already reported success and the checkpoint advanced.
+	return syncDir(filepath.Dir(path))
 }
 
 func (s *LocalSink) atomicWriteBytes(key string, b []byte) error {
 	return s.atomicWrite(key, bytesReader(b))
+}
+
+// ctxReader stops a copy once ctx is cancelled, so a shutdown is not held up
+// by a large object.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }

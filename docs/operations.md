@@ -104,9 +104,26 @@ Delete the query watermark key `<instanceName>_query_<hash>_last_run_ts` and set
 
 ## Verifying an archive
 
-`sf-archive-verify -bucket <bucket> -prefix <prefix>` checks every manifest against its object
-(record count, size, SHA-256) and exits non-zero on mismatches or objects without manifests.
-With `-ledger` it also reconciles against the mock org's ledger.
+`sf-archive-verify -bucket <bucket> -prefix <prefix>` streams every data object and checks it
+against its manifest: record count, compressed and uncompressed size, SHA-256 and the first
+and last record timestamp. It always prints a JSON report and exits 1 if any of these lists is
+non-empty:
+
+| Report field | Meaning |
+|---|---|
+| `manifestMismatches` | Object differs from its manifest, or a manifest has no or a duplicate `objectKey` |
+| `manifestsWithoutObject` | Manifest whose data object is missing (e.g. deleted) |
+| `unreadableObjects` | Data object that could not be fetched or decoded |
+| `unreadableManifests` | Manifest that could not be fetched or parsed |
+| `unsupportedManifests` | Manifest in a format this verifier does not read (written before the record envelope); its object is not decoded |
+
+`objectsWithoutManifest` is reported but only fails the run with `-strict`: such objects are
+normally duplicates left when a manifest upload failed and the batch was archived again.
+`-workers` sets how many objects and manifests are read at once (default 8), and `-timeout` (e.g.
+`2h`) bounds the whole run; by default there is no limit. With `-ledger` it also
+reconciles record identifiers against the mock org's ledger. Exit code 2 means the verifier
+itself could not run (bad flags, bucket not listable, ledger unreachable) or did not finish
+within `-timeout`.
 
 ## Upgrading from earlier builds
 
@@ -140,3 +157,10 @@ Redis. A new deployment can ignore this section.
 - **403 responses no longer tombstone EventLogFiles.** Only 400, 404 and 410
   count towards `unavailableFileAttempts`; 403 (including
   `REQUEST_LIMIT_EXCEEDED`) keeps blocking until it clears.
+- **Partition names for unusual event types.** An event type or instance
+  name containing characters outside `A-Z a-z 0-9 _ . -` now gets a short
+  hash suffix (`Login_Event-1a2b3c`), so `Login Event` and `Login/Event` no
+  longer share a partition. Data for such names continues under the new
+  partition; standard Salesforce event types are unaffected.
+- **`metricsAddr` must be free.** Both collectors now fail at startup if the
+  metrics port cannot be bound, instead of running without `/readyz`.
