@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -66,12 +67,30 @@ func tokenCacheKey(conf *config.EventLogConfig) string {
 	return conf.Name + "_access_token"
 }
 
+// HTTPError carries the status code so callers can tell a permanent rejection
+// (a 4xx that will never succeed) from a transient failure.
+type HTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("Error %d, body: %s", e.StatusCode, e.Body)
+}
+
+// Permanent reports whether retrying the same request is pointless.
+// 401 is excluded (handled by re-login) and so is 429 (rate limiting).
+func (e *HTTPError) Permanent() bool {
+	return e.StatusCode >= 400 && e.StatusCode < 500 &&
+		e.StatusCode != http.StatusUnauthorized && e.StatusCode != http.StatusTooManyRequests
+}
+
 func generateError(resp *http.Response) error {
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
-		return fmt.Errorf("Error %d (could not read the response body)", resp.StatusCode)
+		return &HTTPError{StatusCode: resp.StatusCode, Body: "(could not read the response body)"}
 	}
-	return fmt.Errorf("Error %d, body: %s", resp.StatusCode, respBytes)
+	return &HTTPError{StatusCode: resp.StatusCode, Body: string(respBytes)}
 }
 
 // getJSON runs a GET request and decodes a 200 response into v.
@@ -113,7 +132,7 @@ func RequestLogFiles(ctx context.Context, conf *config.EventLogConfig, db cache.
 
 	log.Debugf("Run EventLogFile SOQL query: %s", soql)
 
-	url := conf.Auth.TokenUrl + "/services/data/v" + conf.ApiVer + "/query?q=" + soql
+	url := queryURL(conf.Auth.TokenUrl+"/services/data/v"+conf.ApiVer+"/query", soql)
 	var all []EventLogfileRecord
 	for page := 0; url != ""; page++ {
 		if page >= maxPages {
@@ -125,7 +144,10 @@ func RequestLogFiles(ctx context.Context, conf *config.EventLogConfig, db cache.
 		}
 		all = append(all, response.Records...)
 		url = ""
-		if !response.Done && response.NextRecordsUrl != "" {
+		if !response.Done {
+			if response.NextRecordsUrl == "" {
+				return nil, fmt.Errorf("EventLogFile query returned an incomplete result set with no nextRecordsUrl (%d of %d records)", len(all), response.TotalSize)
+			}
 			url = conf.Auth.TokenUrl + response.NextRecordsUrl
 		}
 	}
@@ -178,14 +200,20 @@ func DownloadCsvFile(ctx context.Context, conf *config.EventLogConfig, db cache.
 	if copyErr == nil && resp.ContentLength >= 0 && written != resp.ContentLength {
 		copyErr = fmt.Errorf("downloaded %d bytes, expected Content-Length %d", written, resp.ContentLength)
 	}
-	if copyErr == nil && record.LogFileLength > 0 && written != record.LogFileLength {
-		copyErr = fmt.Errorf("downloaded %d bytes, expected LogFileLength %d", written, record.LogFileLength)
+	if copyErr == nil && record.LogFileLength > 0 && float64(written) != record.LogFileLength {
+		copyErr = fmt.Errorf("downloaded %d bytes, expected LogFileLength %.0f", written, record.LogFileLength)
 	}
 	if copyErr != nil {
 		os.Remove(filePath)
 		return "", fmt.Errorf("downloading log file %s: %w", record.Id, copyErr)
 	}
 	return filePath, nil
+}
+
+// queryURL percent-encodes a SOQL statement into the q parameter. Building the
+// URL by hand corrupts any value containing +, &, # or %.
+func queryURL(path, soql string) string {
+	return path + "?" + url.Values{"q": {soql}}.Encode()
 }
 
 // DefaultDownloadStallTimeout cancels an EventLogFile download that receives no data for this long.
@@ -225,6 +253,10 @@ func RequestCustomQuery(ctx context.Context, customQuery *config.QueryConfig, co
 	if customQuery.EndTimestamp == "" {
 		soqlModel.AndWhere(customQuery.Timestamp + " <= " + until.UTC().Format(time.RFC3339))
 	} else {
+		// Bound the window on the end field at both ends. Filtering only the
+		// upper bound skipped records that started before "since" and finished
+		// inside the window (e.g. a job running longer than the overlap).
+		soqlModel.AndWhere(customQuery.EndTimestamp + " >= " + since.UTC().Format(time.RFC3339))
 		soqlModel.AndWhere(customQuery.EndTimestamp + " <= " + until.UTC().Format(time.RFC3339))
 	}
 	soqlModel.Tail(customQuery.Soql.Tail)
@@ -232,13 +264,13 @@ func RequestCustomQuery(ctx context.Context, customQuery *config.QueryConfig, co
 
 	log.Debugf("Run custom SOQL query: %s", soql)
 
-	url := conf.Auth.TokenUrl + "/services/data/v" + customQuery.ApiVer
+	path := conf.Auth.TokenUrl + "/services/data/v" + customQuery.ApiVer
 	if customQuery.ApiName == "rest" {
-		url += "/query"
+		path += "/query"
 	} else {
-		url += "/tooling/query"
+		path += "/tooling/query"
 	}
-	url += "?q=" + soql
+	url := queryURL(path, soql)
 
 	var all []map[string]any
 	for page := 0; url != ""; page++ {
@@ -251,7 +283,12 @@ func RequestCustomQuery(ctx context.Context, customQuery *config.QueryConfig, co
 		}
 		all = append(all, response.Records...)
 		url = ""
-		if !response.Done && response.NextRecordsUrl != "" {
+		if !response.Done {
+			if response.NextRecordsUrl == "" {
+				// Truncated (e.g. a LIMIT in tail): advancing the watermark would
+				// skip the rows that were never returned.
+				return nil, fmt.Errorf("custom query on %s returned an incomplete result set with no nextRecordsUrl (%d of %d records); remove LIMIT/OFFSET from soql.tail", customQuery.Soql.From, len(all), response.TotalSize)
+			}
 			url = conf.Auth.TokenUrl + response.NextRecordsUrl
 		}
 	}

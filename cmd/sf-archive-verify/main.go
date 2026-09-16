@@ -149,13 +149,15 @@ func main() {
 					if ok {
 						topic = m.Lineage["topic"]
 					}
-					id, _ := l.Attributes["EventIdentifier"].(string)
+					// Reconciliation matches the mock ledger, which tracks
+					// EventIdentifier; event_id carries EventUuid.
+					id, _ := l.Payload["EventIdentifier"].(string)
 					add(streamIds, topic, id)
 				case archive.SourceEventLog:
-					id, _ := l.Attributes["REQUEST_ID"].(string)
+					id, _ := l.Payload["REQUEST_ID"].(string)
 					elfIds[id]++
 				case archive.SourceSOQL:
-					id, _ := l.Attributes["Id"].(string)
+					id, _ := l.Payload["Id"].(string)
 					add(customIds, l.EventType, id)
 				}
 			}

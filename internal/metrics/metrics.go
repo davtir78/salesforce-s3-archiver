@@ -80,6 +80,11 @@ var (
 		Help: "Current watermark for EventLogFile and custom query collection.",
 	}, []string{"name"})
 
+	EventLogUnavailable = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "sfarchive_eventlog_unavailable_files_total",
+		Help: "EventLogFiles Salesforce permanently refused to serve, skipped after repeated attempts. Needs investigation.",
+	}, []string{"event_type"})
+
 	EventLogQuarantined = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "sfarchive_eventlog_quarantined_files_total",
 		Help: "EventLogFiles archived as raw lines because they could not be parsed. Needs investigation.",

@@ -66,6 +66,8 @@ type SubscriberOptions struct {
 	Instance string
 	// Organisation ID override; defaults to the authenticated org.
 	OrgId string
+	// Env identifies the deployment (stored in every archived line).
+	Env string
 	// Events requested per FetchRequest.
 	Appetite int32
 	// Flush when this many events are buffered.
@@ -431,11 +433,24 @@ func (s *Subscriber) decode(ctx context.Context, ev *proto.ConsumerEvent) (archi
 		return archive.Record{}, err
 	}
 	return archive.Record{
-		Type:       eventType,
-		Timestamp:  eventTimestamp(fields),
-		Attributes: fields,
-		ReplayId:   append([]byte(nil), ev.GetReplayId()...),
+		Type:      eventType,
+		Id:        streamEventId(fields),
+		Timestamp: eventTimestamp(fields),
+		Payload:   fields,
+		ReplayId:  append([]byte(nil), ev.GetReplayId()...),
 	}, nil
+}
+
+// streamEventId returns the Salesforce-assigned identifier for an event.
+// EventUuid is present on every Real-Time Event Monitoring event; older
+// topics only carry EventIdentifier.
+func streamEventId(fields map[string]any) string {
+	for _, name := range []string{"EventUuid", "EventIdentifier"} {
+		if v, ok := fields[name].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func eventTimestamp(fields map[string]any) time.Time {
@@ -510,6 +525,7 @@ func (s *Subscriber) flush(ctx context.Context) error {
 		meta := archive.ObjectMeta{
 			Source:        archive.SourceStream,
 			OrgId:         orgId,
+			Env:           s.opts.Env,
 			Instance:      s.opts.Instance,
 			EventType:     eventType,
 			PartitionTime: partition,

@@ -23,6 +23,7 @@ func OptionsFromConfig(conf *config.Config, topic string) SubscriberOptions {
 		Topic:                topic,
 		Instance:             es.Name,
 		OrgId:                conf.OrgId,
+		Env:                  conf.Env,
 		Appetite:             es.Appetite,
 		MaxEvents:            es.Batch.MaxEvents,
 		MaxAge:               time.Duration(es.Batch.MaxAgeSeconds) * time.Second,

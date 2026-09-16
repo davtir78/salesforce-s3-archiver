@@ -1,11 +1,14 @@
 package archive
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -52,10 +55,10 @@ func sampleRecords(n int) []Record {
 	out := make([]Record, n)
 	for i := range out {
 		out[i] = Record{
-			Type:       "LoginEventStream",
-			Timestamp:  base.Add(time.Duration(n-i) * time.Second),
-			Attributes: map[string]any{"EventIdentifier": i, "Html": "<b>&</b>"},
-			ReplayId:   []byte{0, 0, 0, byte(i)},
+			Type:      "LoginEventStream",
+			Timestamp: base.Add(time.Duration(n-i) * time.Second),
+			Payload:   map[string]any{"EventIdentifier": i, "Html": "<b>&</b>"},
+			ReplayId:  []byte{0, 0, 0, byte(i)},
 		}
 	}
 	return out
@@ -110,7 +113,7 @@ func TestLocalSinkRoundTrip(t *testing.T) {
 	if err := DecodeObject(f, func(l Line) error { lines = append(lines, l); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if len(lines) != 250 || lines[3].ReplayId == "" || lines[3].OrgId != "org" || lines[3].Attributes["Html"] != "<b>&</b>" {
+	if len(lines) != 250 || lines[3].ReplayId == "" || lines[3].OrgId != "org" || lines[3].Payload["Html"] != "<b>&</b>" {
 		t.Errorf("decoded lines wrong: %d %+v", len(lines), lines[3])
 	}
 
@@ -181,5 +184,52 @@ func TestS3UploadTimesOutOnHungConnection(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("upload did not time out promptly: %s", elapsed)
+	}
+}
+
+// The envelope is the contract downstream tools and Athena tables read.
+func TestLineEnvelope(t *testing.T) {
+	sink := NewMemorySink()
+	meta := ObjectMeta{Source: SourceStream, OrgId: "00D5j0", Instance: "myorg-prod", Env: "prod",
+		EventType: "LoginEventStream"}
+	_, err := WriteRecords(context.Background(), sink, meta, []Record{{
+		Type:      "LoginEventStream",
+		Id:        "9b2c7f4e",
+		Timestamp: time.Date(2026, 9, 15, 1, 2, 3, 4_000_000, time.UTC),
+		Payload:   map[string]any{"EventUuid": "9b2c7f4e", "SourceIp": "10.0.4.7"},
+		ReplayId:  []byte{0, 0, 2, 98},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := sink.Objects()[sink.Keys()[0]]
+	gz, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := io.ReadAll(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(line, &got); err != nil {
+		t.Fatalf("not valid JSON: %v", err)
+	}
+	want := map[string]any{
+		"event_id": "9b2c7f4e", "event_type": "LoginEventStream",
+		"timestamp": "2026-09-15T01:02:03.004Z", "source": "stream", "env": "prod",
+		"org_id": "00D5j0", "instance": "myorg-prod", "replay_id": "AAACYg==",
+	}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("%s = %#v, want %#v", k, got[k], w)
+		}
+	}
+	payload, ok := got["payload"].(map[string]any)
+	if !ok || payload["SourceIp"] != "10.0.4.7" {
+		t.Errorf("payload not preserved: %#v", got["payload"])
+	}
+	if len(got) != len(want)+1 {
+		t.Errorf("unexpected envelope fields: %v", got)
 	}
 }

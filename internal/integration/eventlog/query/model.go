@@ -22,16 +22,21 @@ type EventLogfileResponse struct {
 }
 
 type EventLogfileRecord struct {
-	Id            string `json:"Id"`
-	LogDate       string `json:"LogDate"`
-	CreatedDate   string `json:"CreatedDate"`
-	LogFile       string `json:"LogFile"`
-	EventType     string `json:"EventType"`
-	Interval      string `json:"Interval"`
-	Sequence      int    `json:"Sequence"`
-	LogFileLength int64  `json:"LogFileLength"`
+	Id          string `json:"Id"`
+	LogDate     string `json:"LogDate"`
+	CreatedDate string `json:"CreatedDate"`
+	LogFile     string `json:"LogFile"`
+	EventType   string `json:"EventType"`
+	Interval    string `json:"Interval"`
+	Sequence    int    `json:"Sequence"`
+	// Salesforce types LogFileLength as a double, so the JSON is e.g. 2692.0.
+	LogFileLength float64 `json:"LogFileLength"`
 }
 
+// SoqlQuery builds a SOQL statement with real spaces. Callers must URL-encode
+// it (see queryURL); the previous form baked "+" into the string, which meant a
+// literal "+" in a value reached Salesforce as a space and "&", "#" or "%"
+// truncated or broke the query.
 type SoqlQuery struct {
 	fromTable   string
 	selectAttrs []string
@@ -40,48 +45,49 @@ type SoqlQuery struct {
 }
 
 func (s *SoqlQuery) AndWhere(where string) {
+	if where == "" {
+		return
+	}
 	if s.where == "" {
 		s.where = where
 	} else {
-		s.where += "+AND+" + where
+		s.where += " AND " + where
 	}
 }
 
 func (s *SoqlQuery) OrWhere(where string) {
+	if where == "" {
+		return
+	}
 	if s.where == "" {
 		s.where = where
 	} else {
-		s.where += "+OR+" + where
+		s.where += " OR " + where
 	}
 }
 
 func (s *SoqlQuery) AndOrWhere(where ...string) {
-	resultWhere := "(+"
-	for index, w := range where {
-		if index == len(where)-1 {
-			resultWhere += w + "+)"
-		} else {
-			resultWhere += w + "+OR+"
-		}
+	if len(where) == 0 {
+		return
 	}
+	resultWhere := "( " + strings.Join(where, " OR ") + " )"
 	if s.where == "" {
 		s.where = resultWhere
 	} else {
-		s.where += "+AND+" + resultWhere
+		s.where += " AND " + resultWhere
 	}
 }
 
 func (s *SoqlQuery) Tail(tail string) {
 	if tail != "" {
-		s.tail = "+" + strings.ReplaceAll(tail, " ", "+")
+		s.tail = " " + tail
 	}
 }
 
 func (s *SoqlQuery) Build() string {
-	soql := "SELECT+" + strings.Join(s.selectAttrs, ",") + "+FROM+" + s.fromTable
+	soql := "SELECT " + strings.Join(s.selectAttrs, ",") + " FROM " + s.fromTable
 	if s.where != "" {
-		s.where = strings.ReplaceAll(s.where, " ", "+")
-		soql += "+WHERE+" + s.where
+		soql += " WHERE " + s.where
 	}
 	soql += s.tail
 	return soql

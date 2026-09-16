@@ -88,8 +88,20 @@ lease stops before it can move the checkpoint.
 ```
 
 Stream and SOQL objects are partitioned by ingestion time and use unique names; EventLogFiles
-are partitioned by `LogDate` and named `elf-<Id>`. Each NDJSON line contains `eventType`,
-`timestamp`, `source`, `orgId`, `instance`, `replayId` (streams) and the original `attributes`.
+are partitioned by `LogDate` and named `elf-<Id>`.
+
+Each NDJSON line is an envelope around the unchanged source record:
+
+```json
+{"event_id":"9b2c7f4e","event_type":"LoginEventStream","timestamp":"2026-09-15T01:02:03.004Z",
+ "source":"stream","env":"prod","org_id":"00D...","instance":"myorg-prod","replay_id":"AAAAAAAAAmI=",
+ "payload":{"EventUuid":"9b2c7f4e","UserId":"005...","SourceIp":"10.0.4.7","...":"..."}}
+```
+
+`event_id` is the Salesforce event UUID for streams, the record Id for SOQL, and a hash of
+file Id plus line number for EventLogFile rows (whose rows have no unique field of their own).
+`env` comes from config; everything else is derived from the source. `payload` holds every
+original field unchanged.
 Manifests record the record count, sizes, SHA-256, first/last timestamp and lineage (topic and
 replay ID range, or EventLogFile Id).
 

@@ -120,7 +120,7 @@ func (h *harness) archived() map[string]int {
 	}
 	counts := map[string]int{}
 	for _, l := range lines {
-		id, _ := l.Attributes["EventIdentifier"].(string)
+		id, _ := l.Payload["EventIdentifier"].(string)
 		counts[id]++
 	}
 	return counts
@@ -217,8 +217,8 @@ func TestArchivesEveryEventAndCommitsAfterDurability(t *testing.T) {
 	lines, _ := h.sink.Lines()
 	l := lines[0]
 	for _, field := range []string{"EventUuid", "CreatedDate", "CreatedById", "EventIdentifier", "SourceIp", "Score", "IsSuccess"} {
-		if _, ok := l.Attributes[field]; !ok {
-			t.Errorf("field %s missing from archived event: %v", field, l.Attributes)
+		if _, ok := l.Payload[field]; !ok {
+			t.Errorf("field %s missing from archived event: %v", field, l.Payload)
 		}
 	}
 	if l.EventType != "LoginEventStream" || l.OrgId != h.mock.Options().OrgId || l.ReplayId == "" {

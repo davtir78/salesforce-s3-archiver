@@ -90,7 +90,7 @@ func run() int {
 	}
 
 	metrics.Serve(ctx, conf.MetricsAddr)
-	collector := eventlog.NewCollector(instance, orgId, db, sink)
+	collector := eventlog.NewCollector(instance, orgId, conf.Env, db, sink)
 
 	interval := time.Duration(instance.PollIntervalSeconds) * time.Second
 	if interval == 0 {
