@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -298,10 +299,14 @@ func TestGracefulShutdownFlushesBuffer(t *testing.T) {
 	opts.MaxEvents = 10000
 	opts.MaxAge = time.Hour
 	_, stop := h.run(opts, h.store)
-	h.publish(37)
-	time.Sleep(700 * time.Millisecond) // events are buffered, not yet flushed
-	if n := len(h.sink.Keys()); n != 0 {
-		t.Fatalf("expected no flush before shutdown, got %d objects", n)
+	// The first batch is flushed immediately to pin the replay position;
+	// afterwards events stay buffered until maxEvents/maxAge or shutdown.
+	h.publish(1)
+	h.waitCheckpoint(1, 5*time.Second)
+	h.publish(36)
+	time.Sleep(700 * time.Millisecond)
+	if n := len(h.sink.Keys()); n != 1 {
+		t.Fatalf("expected only the position-pinning flush before shutdown, got %d objects", n)
 	}
 	if err := stop(); err != nil {
 		t.Fatal(err)
@@ -562,6 +567,7 @@ func TestShutdownDuringFlushStillCommits(t *testing.T) {
 	h.publish(50)
 	opts := h.options()
 	opts.MaxEvents = 50
+	opts.Appetite = 100 // one response carries all 50
 
 	client, closeFn := h.client()
 	defer closeFn()
@@ -590,6 +596,8 @@ func TestShutdownFlushFailureIsReported(t *testing.T) {
 	opts.MaxEvents = 10000
 	opts.MaxAge = time.Hour
 	_, stop := h.run(opts, h.store)
+	h.publish(1)
+	h.waitCheckpoint(1, 5*time.Second) // position pinned by the first flush
 	h.publish(20)
 	time.Sleep(500 * time.Millisecond) // buffered, not flushed
 	h.sink.BeforeStore = func(archive.ObjectMeta, int) error { return archive.ErrInjected }
@@ -597,8 +605,8 @@ func TestShutdownFlushFailureIsReported(t *testing.T) {
 	if err == nil || !IsFatal(err) {
 		t.Fatalf("a failed final flush must be reported, got %v", err)
 	}
-	if _, ok := h.store.Checkpoint(h.key); ok {
-		t.Errorf("checkpoint must not be written when the final flush failed")
+	if got, _ := h.store.Checkpoint(h.key); string(got) != string(mocksf.ReplayID(1)) {
+		t.Errorf("checkpoint must stay at the pinned position, got %x", got)
 	}
 }
 
@@ -663,6 +671,8 @@ func TestShutdownFlushIsBoundedByBudget(t *testing.T) {
 	opts.MaxAge = time.Hour
 	opts.ShutdownFlushTimeout = 300 * time.Millisecond
 	_, stop := h.run(opts, h.store)
+	h.publish(1)
+	h.waitCheckpoint(1, 5*time.Second) // position pinned by the first flush
 	h.publish(20)
 	time.Sleep(500 * time.Millisecond)
 	h.sink.StoreDelay = 30 * time.Second // S3 is hanging
@@ -675,8 +685,8 @@ func TestShutdownFlushIsBoundedByBudget(t *testing.T) {
 	if err == nil {
 		t.Errorf("an abandoned final flush must be reported as an error")
 	}
-	if _, ok := h.store.Checkpoint(h.key); ok {
-		t.Errorf("checkpoint must not advance when the flush was abandoned")
+	if got, _ := h.store.Checkpoint(h.key); string(got) != string(mocksf.ReplayID(1)) {
+		t.Errorf("checkpoint must not advance past the pinned position, got %x", got)
 	}
 }
 
@@ -705,5 +715,74 @@ func TestShutdownDuringKeepaliveCommitIsClean(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("subscriber did not stop")
+	}
+}
+
+// With initialReplay LATEST there is no stored position until the first
+// commit. Events received in that window must be archived and pinned, so a
+// reconnect resumes from them instead of jumping to LATEST again.
+func TestLatestBootstrapPinsPositionImmediately(t *testing.T) {
+	h := newHarness(t, mocksf.Options{KeepaliveInterval: time.Hour}) // no keepalive commits
+	opts := h.options()
+	opts.InitialReplay = ReplayLatest
+	opts.MaxEvents = 10000
+	opts.MaxAge = time.Hour // only the pinning flush can commit
+	_, stop := h.run(opts, h.store)
+	defer stop()
+	time.Sleep(700 * time.Millisecond) // let the subscription establish (LATEST skips earlier events)
+
+	h.publish(5)
+	h.waitCheckpoint(5, 5*time.Second)
+	if missing, _, _ := h.reconcile(); missing != 0 {
+		t.Errorf("%d events from the bootstrap window were not archived", missing)
+	}
+}
+
+// The lease must be renewed while a slow final flush runs, otherwise the
+// commit fails and the batch is re-archived after restart.
+func TestLeaseSurvivesSlowShutdownFlush(t *testing.T) {
+	h := newHarness(t, mocksf.Options{})
+	opts := h.options()
+	opts.LeaseTTL = 1 * time.Second
+	opts.ShutdownFlushTimeout = 10 * time.Second
+	opts.MaxEvents = 10000
+	opts.MaxAge = time.Hour
+	_, stop := h.run(opts, h.store)
+	h.publish(1)
+	h.waitCheckpoint(1, 5*time.Second)
+	h.publish(10)
+	time.Sleep(300 * time.Millisecond)
+
+	// The final flush takes longer than the lease TTL.
+	h.sink.StoreDelay = 2500 * time.Millisecond
+	if err := stop(); err != nil {
+		t.Fatalf("shutdown flush should keep the lease: %v", err)
+	}
+	if got, _ := h.store.Checkpoint(h.key); string(got) != string(mocksf.ReplayID(11)) {
+		t.Errorf("checkpoint = %x, want the flushed batch committed", got)
+	}
+	if missing, dups, _ := h.reconcile(); missing != 0 || dups != 0 {
+		t.Errorf("missing=%d duplicates=%d", missing, dups)
+	}
+}
+
+// Credentials that never work must stop the collector rather than retry silently.
+func TestRepeatedAuthFailuresAreFatal(t *testing.T) {
+	h := newHarness(t, mocksf.Options{})
+	h.mock.SetFaults(mocksf.Faults{FailLogins: 1000})
+	opts := h.options()
+	opts.RetryDelay = time.Millisecond
+	done, stop := h.run(opts, h.store)
+	defer stop()
+	select {
+	case err := <-done:
+		if !IsFatal(err) || !strings.Contains(err.Error(), "authentication failed") {
+			t.Fatalf("got %v, want a fatal authentication error", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("collector kept retrying bad credentials")
+	}
+	if metrics.IsReady() {
+		t.Errorf("must not report ready while authentication is failing")
 	}
 }
