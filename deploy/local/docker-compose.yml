@@ -21,7 +21,8 @@ x-collector: &collector
     REDIS_PASSWORD: devpass
   volumes:
     - ./config:/config:ro
-    - ../../dev/certs:/certs:ro
+    # Only the CA certificate: the collectors never need the private key.
+    - ../../dev/certs/ca.crt:/certs/ca.crt:ro
   depends_on:
     mock-salesforce:
       condition: service_started

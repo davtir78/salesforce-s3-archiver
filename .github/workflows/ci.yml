@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       valkey:
-        image: valkey/valkey:8-alpine
+        image: valkey/valkey:8-alpine@sha256:d2e18f3410b6f616de1417f570fa55261af2898b9c5b2cfb6781ce2373ea43d1
         ports: ["6379:6379"]
     steps:
       - uses: actions/checkout@v4
@@ -26,9 +26,23 @@ jobs:
         run: go vet ./...
       - name: start minio and create bucket
         run: |
-          docker run -d -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio:latest server /data
+          docker run -d -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
           for i in $(seq 1 30); do curl -sf http://localhost:9000/minio/health/live && break; sleep 1; done
           AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin aws --endpoint-url http://localhost:9000 --region us-east-1 s3 mb s3://archive
+      - name: start valkey with TLS and a password
+        run: |
+          bash scripts/dev-certs.sh
+          docker run -d -p 6380:6380 -v "$PWD/dev/certs:/certs:ro" \
+            valkey/valkey:8-alpine@sha256:d2e18f3410b6f616de1417f570fa55261af2898b9c5b2cfb6781ce2373ea43d1 \
+            valkey-server --port 0 --tls-port 6380 \
+            --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key \
+            --tls-ca-cert-file /certs/ca.crt --tls-auth-clients no --requirepass devpass
+          for i in $(seq 1 30); do
+            docker run --rm --network host -v "$PWD/dev/certs:/certs:ro" \
+              valkey/valkey:8-alpine@sha256:d2e18f3410b6f616de1417f570fa55261af2898b9c5b2cfb6781ce2373ea43d1 \
+              valkey-cli --tls --cacert /certs/ca.crt -a devpass --no-auth-warning -p 6380 ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
       - name: test (race)
         env:
           LOG_LEVEL: error
@@ -40,6 +54,16 @@ jobs:
           AWS_SECRET_ACCESS_KEY: minioadmin
           AWS_REGION: us-east-1
         run: go test -race -count=1 ./...
+      - name: test (redis TLS + password)
+        env:
+          LOG_LEVEL: error
+          REDIS_TEST_HOST: localhost
+          REDIS_TEST_PORT: "6380"
+          REDIS_TEST_TLS: "true"
+          REDIS_TEST_PASSWORD: devpass
+        run: |
+          export REDIS_TEST_CA_FILE="$PWD/dev/certs/ca.crt"
+          go test -count=1 ./internal/checkpoint ./internal/cache/...
 
   docker:
     runs-on: ubuntu-latest

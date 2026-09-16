@@ -38,17 +38,36 @@ resource "aws_iam_role" "collector" {
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
 }
 
+# Writes are limited to this run's prefix, so a collector cannot overwrite
+# another run's archive (or its manifests).
 data "aws_iam_policy_document" "collector" {
   statement {
     sid       = "ArchiveWrite"
     actions   = ["s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
-    resources = ["${aws_s3_bucket.archive.arn}/*"]
+    resources = ["${aws_s3_bucket.archive.arn}/${local.prefix}/*"]
   }
   statement {
     sid       = "ArchiveKms"
     actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
     resources = [aws_kms_key.archive.arn]
   }
+}
+
+resource "aws_iam_role_policy" "collector" {
+  name   = "collector"
+  role   = aws_iam_role.collector.id
+  policy = data.aws_iam_policy_document.collector.json
+}
+
+# Only the stream collector authenticates to ElastiCache with IAM; the event
+# log collector uses a password and a different Valkey user.
+resource "aws_iam_role" "stream" {
+  name               = "${var.name}-stream"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+data "aws_iam_policy_document" "stream" {
+  source_policy_documents = [data.aws_iam_policy_document.collector.json]
   statement {
     sid     = "ElastiCacheIamAuth"
     actions = ["elasticache:Connect"]
@@ -59,10 +78,10 @@ data "aws_iam_policy_document" "collector" {
   }
 }
 
-resource "aws_iam_role_policy" "collector" {
-  name   = "collector"
-  role   = aws_iam_role.collector.id
-  policy = data.aws_iam_policy_document.collector.json
+resource "aws_iam_role_policy" "stream" {
+  name   = "stream-collector"
+  role   = aws_iam_role.stream.id
+  policy = data.aws_iam_policy_document.stream.json
 }
 
 # Verification task role: read-only access to the archive.

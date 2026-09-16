@@ -11,9 +11,8 @@ variable "name" {
 }
 
 variable "image_tag" {
-  description = "Tag of the collector image in the ECR repository."
+  description = "Tag of the collector image in the ECR repository. Set by scripts/aws-deploy.sh to the commit SHA; there is no default because ECR tags are immutable and \"latest\" never exists."
   type        = string
-  default     = "latest"
 }
 
 variable "admin_cidr" {
@@ -38,6 +37,10 @@ variable "salesforce_token_url" {
   description = "Salesforce My Domain URL when not using the mock (e.g. https://example.my.salesforce.com)."
   type        = string
   default     = ""
+  validation {
+    condition     = var.use_mock_salesforce || (var.salesforce_token_url != "" && var.salesforce_client_id != "" && var.salesforce_client_secret != "")
+    error_message = "With use_mock_salesforce = false, salesforce_token_url, salesforce_client_id and salesforce_client_secret are all required."
+  }
 }
 
 variable "salesforce_client_id" {
@@ -75,4 +78,42 @@ variable "cache_snapshot_retention_days" {
   description = "Automatic ElastiCache snapshot retention. Test stacks use 0 because automatic snapshots can outlive a destroyed replication group."
   type        = number
   default     = 0
+}
+
+variable "object_lock_mode" {
+  description = "S3 Object Lock mode for archived data: \"\" (off), GOVERNANCE or COMPLIANCE. Can only be set when the bucket is created."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "GOVERNANCE", "COMPLIANCE"], var.object_lock_mode)
+    error_message = "object_lock_mode must be empty, GOVERNANCE or COMPLIANCE."
+  }
+}
+
+variable "object_lock_days" {
+  description = "Retention period in days when object_lock_mode is set."
+  type        = number
+  default     = 365
+}
+
+variable "noncurrent_version_days" {
+  description = "How long overwritten object versions are kept. Overwrites should not happen, so this is a recovery window."
+  type        = number
+  default     = 365
+}
+
+variable "stream_initial_replay" {
+  description = "Where stream topics start when no checkpoint exists: EARLIEST, LATEST, or empty to refuse to start (the safe steady-state setting). Ignored when use_mock_salesforce is true, which always bootstraps from EARLIEST."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "EARLIEST", "LATEST"], var.stream_initial_replay)
+    error_message = "stream_initial_replay must be empty, EARLIEST or LATEST."
+  }
+}
+
+variable "alarm_email" {
+  description = "Address subscribed to the alarm topic. Empty creates the topic without a subscription."
+  type        = string
+  default     = ""
 }
