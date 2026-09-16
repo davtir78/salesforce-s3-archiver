@@ -13,7 +13,11 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$HOST_DIR:/certs" alpine:3.22 sh -c '
   printf "subjectAltName=DNS:localhost,DNS:valkey,DNS:redis,IP:127.0.0.1\n" > san.ext
   openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" -keyout server.key -out server.csr 2>/dev/null
   openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 30 -extfile san.ext -out server.crt 2>/dev/null
-  chmod 644 server.key ca.key
+  # ca.key is only needed here, to sign. server.key must stay readable by the
+  # unprivileged valkey user inside the container that mounts it; it is a
+  # throwaway 30-day key for local TLS tests, and dev/ is never committed.
+  chmod 600 ca.key
+  chmod 644 server.key
   rm -f server.csr san.ext ca.srl
 '
 echo "certificates written to dev/certs"

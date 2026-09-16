@@ -38,6 +38,11 @@ about 10 minutes old.
 A stream collector that exits with an error is **meant** to be restarted by the orchestrator.
 Alert on restart loops: they indicate a condition that needs a human (see below).
 
+The AWS stack wires this up: an EventBridge rule publishes to an SNS topic whenever a task stops
+with a non-zero exit code, and CloudWatch alarms fire on the log lines `CHECKPOINT RESET`,
+`QUARANTINED`, `UNAVAILABLE EventLogFile` and `stored replay ID was rejected`. Set `alarm_email`
+to receive them.
+
 ## Recovery procedures
 
 ### Stream collector refuses to start: "no replay checkpoint exists"
@@ -124,6 +129,15 @@ normally duplicates left when a manifest upload failed and the batch was archive
 reconciles record identifiers against the mock org's ledger. Exit code 2 means the verifier
 itself could not run (bad flags, bucket not listable, ledger unreachable) or did not finish
 within `-timeout`.
+
+On AWS the cache and archive are only reachable from inside the VPC, so run recovery commands as
+one-off tasks:
+
+```bash
+bash scripts/aws-run-task.sh stream -reset-checkpoints /event/LoginEventStream -confirm
+bash scripts/aws-run-task.sh eventlog -once
+bash scripts/aws-run-task.sh verify -strict
+```
 
 ## Upgrading from earlier builds
 

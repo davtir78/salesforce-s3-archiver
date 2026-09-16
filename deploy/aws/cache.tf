@@ -30,22 +30,27 @@ resource "aws_elasticache_user" "default" {
   }
 }
 
+# Stream collector: replay checkpoints and leases only. It runs Lua scripts, so
+# it needs @scripting, but not the dangerous commands (FLUSHALL, CONFIG, ...)
+# that could wipe another collector's state.
 resource "aws_elasticache_user" "iam" {
   # IAM authentication requires user_id == user_name.
   user_id       = "${var.name}-archiver-iam"
   user_name     = "${var.name}-archiver-iam"
   engine        = "valkey"
-  access_string = "on ~* +@all"
+  access_string = "on ~${var.cache_key_prefix}sfarch:* resetchannels +@read +@write +@scripting +@connection -@dangerous"
   authentication_mode {
     type = "iam"
   }
 }
 
+# Event log collector: watermarks, tokens and de-duplication markers, all
+# namespaced by instance name. It cannot touch the stream checkpoints.
 resource "aws_elasticache_user" "password" {
   user_id       = "${var.name}-archiver-pw"
   user_name     = "archiver"
   engine        = "valkey"
-  access_string = "on ~* +@all"
+  access_string = "on ~${var.cache_key_prefix}${local.instance}_* resetchannels +@read +@write +@connection -@dangerous"
   authentication_mode {
     type      = "password"
     passwords = [random_password.cache_archiver.result]

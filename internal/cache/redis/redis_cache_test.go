@@ -15,7 +15,15 @@ func TestRedisCacheTTLs(t *testing.T) {
 		t.Skip("REDIS_TEST_HOST not set")
 	}
 	port, _ := strconv.Atoi(os.Getenv("REDIS_TEST_PORT"))
-	c, err := NewRedisCache(RedisConfig{Host: host, Port: port, Password: os.Getenv("REDIS_TEST_PASSWORD")})
+	c, err := NewRedisCache(RedisConfig{
+		Host:     host,
+		Port:     port,
+		Password: os.Getenv("REDIS_TEST_PASSWORD"),
+		TLS: TLSConfig{
+			Enabled: os.Getenv("REDIS_TEST_TLS") == "true",
+			CAFile:  os.Getenv("REDIS_TEST_CA_FILE"),
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

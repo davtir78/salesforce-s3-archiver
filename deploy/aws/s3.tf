@@ -12,6 +12,24 @@ resource "aws_kms_alias" "archive" {
 resource "aws_s3_bucket" "archive" {
   bucket        = "${var.name}-archive-${data.aws_caller_identity.current.account_id}"
   force_destroy = var.force_destroy
+  # Object Lock can only be enabled when the bucket is created; changing it
+  # later replaces the bucket.
+  object_lock_enabled = var.object_lock_mode != ""
+}
+
+# Write-once retention for archived evidence. GOVERNANCE can be overridden by a
+# user with the bypass permission; COMPLIANCE cannot be overridden by anyone,
+# including the root account, until the retention period expires.
+resource "aws_s3_bucket_object_lock_configuration" "archive" {
+  count  = var.object_lock_mode == "" ? 0 : 1
+  bucket = aws_s3_bucket.archive.id
+  rule {
+    default_retention {
+      mode = var.object_lock_mode
+      days = var.object_lock_days
+    }
+  }
+  depends_on = [aws_s3_bucket_versioning.archive]
 }
 
 resource "aws_s3_bucket_ownership_controls" "archive" {
@@ -54,7 +72,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "archive" {
     status = "Enabled"
     filter {}
     noncurrent_version_expiration {
-      noncurrent_days = 30
+      noncurrent_days = var.noncurrent_version_days
     }
     abort_incomplete_multipart_upload {
       days_after_initiation = 3
