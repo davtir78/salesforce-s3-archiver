@@ -176,9 +176,10 @@ func (c *PubSubClient) GetSchema(ctx context.Context, schemaId string) (*proto.S
 func (c *PubSubClient) DecodeEvent(ctx context.Context, event *proto.ConsumerEvent) (map[string]any, string, error) {
 	entry, err := c.fetchSchema(ctx, event.GetEvent().GetSchemaId())
 	if err != nil {
-		// Transport or auth failure, not a corrupt event: the caller can
-		// reconnect instead of stopping the collector.
-		return nil, "", &SchemaFetchError{SchemaId: event.GetEvent().GetSchemaId(), Err: err}
+		// A SchemaFetchError (transport or auth failure) lets the caller
+		// reconnect; a schema that cannot be parsed is returned as is, because
+		// fetching it again will not help.
+		return nil, "", err
 	}
 	parsed, _, err := entry.codec.NativeFromBinary(event.GetEvent().GetPayload())
 	if err != nil {
@@ -209,19 +210,28 @@ func (c *PubSubClient) fetchSchema(ctx context.Context, schemaId string) (*schem
 	log.Debugf("Making GetSchema request for uncached schema %s", schemaId)
 	schema, err := c.GetSchema(ctx, schemaId)
 	if err != nil {
-		return nil, err
+		return nil, &SchemaFetchError{SchemaId: schemaId, Err: err}
 	}
-	codec, err := goavro.NewCodec(schema.GetSchemaJson())
+	entry, err := parseSchema(schema.GetSchemaJson())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("schema %s: %w", schemaId, err)
 	}
-	flattener, err := NewFlattener(schema.GetSchemaJson())
-	if err != nil {
-		return nil, err
-	}
-	entry := &schemaEntry{codec: codec, flattener: flattener}
 	c.schemaCache[schemaId] = entry
 	return entry, nil
+}
+
+// parseSchema builds the codec and flattener for a schema. An error here is
+// permanent: the same schema will fail the same way.
+func parseSchema(schemaJSON string) (*schemaEntry, error) {
+	codec, err := goavro.NewCodec(schemaJSON)
+	if err != nil {
+		return nil, fmt.Errorf("parsing avro schema: %w", err)
+	}
+	flattener, err := NewFlattener(schemaJSON)
+	if err != nil {
+		return nil, err
+	}
+	return &schemaEntry{codec: codec, flattener: flattener}, nil
 }
 
 func parseTypeName(codec *goavro.Codec) string {

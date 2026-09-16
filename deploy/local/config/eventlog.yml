@@ -11,6 +11,7 @@ eventLog:
   watermarkOverlapMinutes: 60
   auth:
     tokenUrl: http://mock-salesforce:8080
+    allowInsecureHttp: true              # mock org only
     clientCred:
       clientId: $SF_CLIENT_ID
       clientSecret: $SF_CLIENT_SECRET

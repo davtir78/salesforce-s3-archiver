@@ -11,7 +11,7 @@ eventLog:
   pollIntervalSeconds: 300
   watermarkOverlapMinutes: 60            # re-read window for late-arriving records
   auth:
-    tokenUrl: https://example.my.salesforce.com
+    tokenUrl: https://example.my.salesforce.com   # My Domain URL; must be https
     clientCred:
       clientId: $SF_CLIENT_ID
       clientSecret: $SF_CLIENT_SECRET

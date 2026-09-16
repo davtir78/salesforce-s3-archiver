@@ -197,7 +197,13 @@ DURATION=300 bash scripts/chaos-local.sh
 
 See [config_sample_eventstream.yml](config_sample_eventstream.yml) and
 [config_sample_eventlog.yml](config_sample_eventlog.yml). Values of the form `$VAR` are read
-from environment variables.
+from environment variables, including inside lists.
+
+`auth.tokenUrl` is the org's My Domain URL and must use `https`; the event log collector also
+sends its REST API calls there. `allowInsecureHttp: true` permits `http://` for a local mock
+org only, since credentials and tokens would otherwise cross the network unencrypted. For the
+JWT flow, `jwt.audience` sets the `aud` claim; Salesforce expects `https://login.salesforce.com`
+(`https://test.salesforce.com` for sandboxes), and it defaults to `tokenUrl`.
 
 ```bash
 sf-archive-stream   -config stream.yml

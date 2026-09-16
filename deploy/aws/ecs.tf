@@ -63,6 +63,7 @@ locals {
       instanceName: ${local.instance}
       auth:
         tokenUrl: ${local.token_url}
+        allowInsecureHttp: ${var.use_mock_salesforce}
         clientCred:
           clientId: ${local.client_id}
           clientSecret: $SF_CLIENT_SECRET
@@ -107,6 +108,7 @@ locals {
       pollIntervalSeconds: ${var.use_mock_salesforce ? 30 : 300}
       auth:
         tokenUrl: ${local.token_url}
+        allowInsecureHttp: ${var.use_mock_salesforce}
         clientCred:
           clientId: ${local.client_id}
           clientSecret: $SF_CLIENT_SECRET

@@ -8,7 +8,8 @@ metricsAddr: ":9090"
 eventStream:
   instanceName: myorg-prod               # unique per org; part of checkpoint keys
   auth:
-    tokenUrl: https://example.my.salesforce.com
+    tokenUrl: https://example.my.salesforce.com   # My Domain URL; must be https
+    # allowInsecureHttp: true              # only for a local mock org on http://
     # Exactly one auth method. Client credentials or JWT are recommended.
     clientCred:
       clientId: $SF_CLIENT_ID
@@ -17,6 +18,7 @@ eventStream:
     #   clientId: $SF_CLIENT_ID
     #   privateKey: /secrets/salesforce.key
     #   username: integration@example.com
+    #   audience: https://login.salesforce.com   # JWT aud; https://test.salesforce.com for sandboxes (default: tokenUrl)
   cache:
     redis:                               # required for the stream collector
       host: master.my-cache.xxxxxx.apse2.cache.amazonaws.com

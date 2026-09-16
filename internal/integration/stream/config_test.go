@@ -10,7 +10,7 @@ func rightStreamConf() *config.EventStreamConfig {
 	return &config.EventStreamConfig{
 		Name: "my-instance-name",
 		Auth: config.AuthConfig{
-			TokenUrl: "http://example.com",
+			TokenUrl: "https://example.com",
 			UserPass: &config.UserPassAuth{
 				ClientId:     "client_id",
 				ClientSecret: "client_secret",

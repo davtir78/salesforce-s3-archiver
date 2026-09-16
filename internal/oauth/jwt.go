@@ -19,6 +19,10 @@ func AuthWithJwt(tokenUrl string, auth *config.JwtAuth) (*AuthResponse, error) {
 	privateKeyPath := auth.PrivateKey
 	clientID := auth.ClientId
 	username := auth.Username
+	audience := auth.Audience
+	if audience == "" {
+		audience = tokenUrl
+	}
 
 	// Load private key
 	privateKeyData, err := os.ReadFile(privateKeyPath)
@@ -34,7 +38,7 @@ func AuthWithJwt(tokenUrl string, auth *config.JwtAuth) (*AuthResponse, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 		"iss": clientID,
 		"sub": username,
-		"aud": tokenUrl,
+		"aud": audience,
 		"exp": time.Now().Add(time.Minute * 5).Unix(),
 	})
 	signedToken, err := token.SignedString(privateKey)
