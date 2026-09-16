@@ -98,8 +98,9 @@ Each NDJSON line is an envelope around the unchanged source record:
  "payload":{"EventUuid":"9b2c7f4e","UserId":"005...","SourceIp":"10.0.4.7","...":"..."}}
 ```
 
-`event_id` is the Salesforce event UUID for streams, the record Id for SOQL, and a hash of
-file Id plus line number for EventLogFile rows (whose rows have no unique field of their own).
+`event_id` is the Salesforce event UUID for streams, the record Id plus its timestamp values for
+SOQL (`<Id>@<timestamp>`, so each archived version of a changed record is distinct), and a hash
+of file Id plus line number for EventLogFile rows (whose rows have no unique field of their own).
 `env` comes from config; everything else is derived from the source. `payload` holds every
 original field unchanged.
 Manifests record the record count, sizes, SHA-256, first/last timestamp and lineage (topic and

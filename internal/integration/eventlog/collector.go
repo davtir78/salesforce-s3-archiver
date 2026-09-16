@@ -487,17 +487,33 @@ func buildCustomRecord(row map[string]any, q *config.QueryConfig) archive.Record
 		}
 	}
 	delete(attrs, "attributes")
-	recordId, _ := row["Id"].(string)
-	if recordId == "" {
-		recordId = buildCustomId(row, q)
-	}
 	ts := time.Now()
 	if s, ok := row[q.Timestamp].(string); ok {
 		if t, err := parseSFDate(s); err == nil {
 			ts = t
 		}
 	}
-	return archive.Record{Type: eventType, Id: recordId, Timestamp: ts.UTC(), Payload: attrs}
+	return archive.Record{Type: eventType, Id: customEventId(row, q), Timestamp: ts.UTC(), Payload: attrs}
+}
+
+// customEventId identifies one archived version of a query row: the record Id
+// (or custom ID) plus the timestamp values it was selected on. The collector
+// archives a row again when those values change (e.g. a LastModifiedDate
+// query), so the Id alone would give every version the same event_id and
+// downstream de-duplication on event_id would drop all but one of them.
+func customEventId(row map[string]any, q *config.QueryConfig) string {
+	id, _ := row["Id"].(string)
+	if id == "" {
+		id = buildCustomId(row, q)
+	}
+	if id == "" {
+		return ""
+	}
+	id += "@" + fmt.Sprint(row[q.Timestamp])
+	if q.EndTimestamp != "" {
+		id += "@" + fmt.Sprint(row[q.EndTimestamp])
+	}
+	return id
 }
 
 func buildCustomId(record map[string]any, customQuery *config.QueryConfig) string {
