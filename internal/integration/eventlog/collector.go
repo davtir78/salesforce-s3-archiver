@@ -211,7 +211,7 @@ func (c *Collector) archiveLogFile(ctx context.Context, rec *query.EventLogfileR
 	path, err := query.DownloadCsvFile(ctx, c.conf, c.db, rec, c.DownloadDir)
 	if err != nil {
 		metrics.EventLogFailures.WithLabelValues("download").Inc()
-		return err
+		return c.handleDownloadFailure(ctx, rec, created, err)
 	}
 	defer func() {
 		if err := os.Remove(path); err != nil {
@@ -354,10 +354,17 @@ func csvRowId(fileId string, line int) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-func (c *Collector) queryWatermarkKey(q *config.QueryConfig) string {
+// queryHash identifies one configured query. Two queries on the same object
+// must not share watermarks or de-duplication markers, otherwise one query
+// marks rows the other never archived.
+func queryHash(q *config.QueryConfig) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s|%v|%s|%s|%s|%s|%s", q.Soql.From, q.Soql.Select, q.Soql.Where, q.Soql.Tail, q.Timestamp, q.EndTimestamp, q.ApiName)
-	return c.conf.Name + "_query_" + hex.EncodeToString(h.Sum(nil))[:16] + "_last_run_ts"
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+func (c *Collector) queryWatermarkKey(q *config.QueryConfig) string {
+	return c.conf.Name + "_query_" + queryHash(q) + "_last_run_ts"
 }
 
 func (c *Collector) collectCustomQuery(ctx context.Context, q *config.QueryConfig) error {
@@ -454,7 +461,11 @@ func (c *Collector) rowDedupKey(q *config.QueryConfig, row map[string]any) strin
 	if id == "" {
 		return ""
 	}
-	return c.conf.Name + "_soql_" + q.Soql.From + "_" + id + "_" + fmt.Sprint(row[q.Timestamp])
+	ts := fmt.Sprint(row[q.Timestamp])
+	if q.EndTimestamp != "" {
+		ts += "|" + fmt.Sprint(row[q.EndTimestamp])
+	}
+	return c.conf.Name + "_soql_" + queryHash(q) + "_" + id + "_" + ts
 }
 
 func buildCustomRecord(row map[string]any, q *config.QueryConfig) archive.Record {
@@ -493,7 +504,9 @@ func buildCustomId(record map[string]any, customQuery *config.QueryConfig) strin
 			log.Warnf("Custom ID field '%s' is not present in the event of type '%s'.", fieldName, customQuery.Soql.From)
 			return ""
 		}
-		fmt.Fprintf(hashVal, "%v", fieldVal)
+		// Length-prefixed so ("ab","c") and ("a","bc") cannot collide.
+		v := fmt.Sprint(fieldVal)
+		fmt.Fprintf(hashVal, "%d:%s|", len(v), v)
 	}
 	return hex.EncodeToString(hashVal.Sum(nil))
 }

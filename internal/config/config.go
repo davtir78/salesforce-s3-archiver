@@ -190,6 +190,9 @@ type EventLogConfig struct {
 	// Polls a file may fail CSV parsing before its raw lines are archived to a
 	// quarantine object and processing moves past it (default 3).
 	MalformedFileAttempts int `mapstructure:"malformedFileAttempts"`
+	// Polls a file may fail to download with a permanent error (404, 400)
+	// before it is recorded as unavailable and skipped (default 5).
+	UnavailableFileAttempts int `mapstructure:"unavailableFileAttempts"`
 	// Records per archived object for custom queries (default 10000).
 	RecordsPerObject int `mapstructure:"recordsPerObject"`
 }

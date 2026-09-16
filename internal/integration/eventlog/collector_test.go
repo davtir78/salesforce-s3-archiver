@@ -470,3 +470,136 @@ func TestSoqlLargeNumbersAreExact(t *testing.T) {
 		t.Errorf("BigNumber = %s, want 9007199254740993 (float64 would round it)", got)
 	}
 }
+
+// Two queries on the same object must not share de-duplication markers.
+func TestDedupKeysAreScopedPerQuery(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.SkipLogFiles = true
+	qA := config.QueryConfig{
+		Soql:   config.SoqlConfig{Select: []string{"Id", "Action", "CreatedDate"}, From: "SetupAuditTrail"},
+		ApiVer: "64.0", ApiName: "rest", Timestamp: "CreatedDate",
+	}
+	qB := config.QueryConfig{
+		Soql:   config.SoqlConfig{Select: []string{"Id", "Section", "CreatedDate"}, From: "SetupAuditTrail"},
+		ApiVer: "64.0", ApiName: "rest", Timestamp: "CreatedDate",
+	}
+	h.conf.CustomQueries = []config.QueryConfig{qA, qB}
+	h.mock.AddCustomRecords("SetupAuditTrail", time.Now().Add(-5*time.Minute), 4)
+
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lines, _ := h.sink.Lines()
+	if len(lines) != 8 {
+		t.Fatalf("each query must archive all 4 rows (8 lines), got %d", len(lines))
+	}
+	withAction, withSection := 0, 0
+	for _, l := range lines {
+		if _, ok := l.Payload["Action"]; ok {
+			withAction++
+		}
+		if _, ok := l.Payload["Section"]; ok {
+			withSection++
+		}
+	}
+	if withAction != 4 || withSection != 4 {
+		t.Errorf("expected 4 rows per query, got action=%d section=%d", withAction, withSection)
+	}
+}
+
+// A truncated result set must fail instead of advancing the watermark.
+func TestIncompleteResultSetFailsPoll(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{TruncateQueryResults: true})
+	h.conf.SkipLogFiles = true
+	h.conf.CustomQueries = []config.QueryConfig{{
+		Soql:   config.SoqlConfig{Select: []string{"Id", "CreatedDate"}, From: "SetupAuditTrail"},
+		ApiVer: "64.0", ApiName: "rest", Timestamp: "CreatedDate",
+	}}
+	h.mock.AddCustomRecords("SetupAuditTrail", time.Now().Add(-5*time.Minute), 10)
+	key := h.c.queryWatermarkKey(&h.conf.CustomQueries[0])
+
+	err := h.c.Poll(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "incomplete result set") {
+		t.Fatalf("expected an incomplete result set error, got %v", err)
+	}
+	if _, ok, _ := h.c.watermark(key); ok {
+		t.Errorf("watermark must not advance when results were truncated")
+	}
+}
+
+func TestBuildCustomIdCannotCollide(t *testing.T) {
+	q := &config.QueryConfig{CustomId: []string{"a", "b"}, Soql: config.SoqlConfig{From: "T"}}
+	first := buildCustomId(map[string]any{"a": "ab", "b": "c"}, q)
+	second := buildCustomId(map[string]any{"a": "a", "b": "bc"}, q)
+	if first == "" || second == "" {
+		t.Fatal("custom ids should be produced")
+	}
+	if first == second {
+		t.Errorf("field values must be delimited: %q collides", first)
+	}
+}
+
+// A file Salesforce permanently refuses (404) must not block newer files forever.
+func TestPermanentlyUnavailableFileIsSkipped(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.UnavailableFileAttempts = 3
+	base := time.Now().Add(-20 * time.Minute)
+	h.mock.AddEventLogFile("Login", base, 5)
+	gone := h.mock.AddEventLogFile("Login", base.Add(time.Minute), 5)
+	h.mock.AddEventLogFile("Login", base.Add(2*time.Minute), 5)
+	h.mock.DeleteEventLogFileBody(gone) // downloads now 404
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := h.c.Poll(context.Background()); err == nil {
+			t.Fatalf("attempt %d: expected the download failure to block", attempt)
+		}
+		if n := len(h.sink.Keys()); n != 1 {
+			t.Fatalf("attempt %d: expected only the first file archived, got %d", attempt, n)
+		}
+	}
+
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatalf("third poll should record the file as unavailable: %v", err)
+	}
+	var tombstone string
+	for _, k := range h.sink.Keys() {
+		if strings.Contains(k, "elf-"+gone+"-unavailable") {
+			tombstone = k
+		}
+	}
+	if tombstone == "" {
+		t.Fatalf("no tombstone object in %v", h.sink.Keys())
+	}
+	m, _ := h.sink.Manifest(tombstone)
+	if m.Lineage["unavailableReason"] == "" {
+		t.Errorf("tombstone manifest should record the reason: %+v", m.Lineage)
+	}
+	if n := len(h.sink.Keys()); n != 3 {
+		t.Errorf("expected first file, tombstone and third file, got %d objects", n)
+	}
+}
+
+// A transient failure must keep blocking: skipping would lose retrievable data.
+func TestTransientDownloadFailureKeepsBlocking(t *testing.T) {
+	h := newELFHarness(t, mocksf.Options{})
+	h.conf.UnavailableFileAttempts = 2
+	h.mock.AddEventLogFile("Login", time.Now().Add(-5*time.Minute), 5)
+	for attempt := 1; attempt <= 3; attempt++ {
+		h.mock.SetFaults(mocksf.Faults{FailRestRequests: 2}) // 500s
+		if err := h.c.Poll(context.Background()); err == nil {
+			t.Fatalf("attempt %d: a 5xx must not be treated as permanent", attempt)
+		}
+	}
+	h.mock.SetFaults(mocksf.Faults{})
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h.missingRows() != 0 {
+		t.Errorf("rows lost after transient failures")
+	}
+	for _, k := range h.sink.Keys() {
+		if strings.Contains(k, "unavailable") {
+			t.Errorf("transient failure must not produce a tombstone: %s", k)
+		}
+	}
+}

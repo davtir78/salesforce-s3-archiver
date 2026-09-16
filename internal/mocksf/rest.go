@@ -3,6 +3,7 @@ package mocksf
 import (
 	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -24,6 +25,8 @@ type eventLogFile struct {
 	csv         []byte
 	// logDateRaw overrides the LogDate value returned by queries (tests).
 	logDateRaw string
+	// deleted makes the download return 404 while the record is still listed.
+	deleted bool
 }
 
 type queryCursor struct {
@@ -227,14 +230,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, version str
 				continue
 			}
 			records = append(records, map[string]any{
-				"attributes":    map[string]any{"type": "EventLogFile", "url": "/services/data/" + version + "/sobjects/EventLogFile/" + f.Id},
-				"Id":            f.Id,
-				"EventType":     f.EventType,
-				"CreatedDate":   f.CreatedDate.Format(sfDateFormat),
-				"LogDate":       f.logDate(),
-				"Interval":      f.Interval,
-				"Sequence":      f.Sequence,
-				"LogFileLength": len(f.csv),
+				"attributes":  map[string]any{"type": "EventLogFile", "url": "/services/data/" + version + "/sobjects/EventLogFile/" + f.Id},
+				"Id":          f.Id,
+				"EventType":   f.EventType,
+				"CreatedDate": f.CreatedDate.Format(sfDateFormat),
+				"LogDate":     f.logDate(),
+				"Interval":    f.Interval,
+				"Sequence":    f.Sequence,
+				// Salesforce types this as a double: the JSON is e.g. 2692.0.
+				"LogFileLength": json.Number(fmt.Sprintf("%d.0", len(f.csv))),
 				"LogFile":       "/services/data/" + version + "/sobjects/EventLogFile/" + f.Id + "/LogFile",
 			})
 		}
@@ -289,6 +293,11 @@ func (s *Server) respondPage(w http.ResponseWriter, records []map[string]any, of
 		"done":      end >= len(records),
 		"records":   records[offset:end],
 	}
+	if s.opts.TruncateQueryResults {
+		resp["done"] = false
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	if records == nil {
 		resp["records"] = []any{}
 	}
@@ -327,7 +336,7 @@ func (s *Server) handleLogFile(w http.ResponseWriter, id string) {
 		s.faults.TruncateNextDownload = 0
 	}
 	s.mu.Unlock()
-	if file == nil {
+	if file == nil || file.deleted {
 		writeJSON(w, http.StatusNotFound, []map[string]string{{"errorCode": "NOT_FOUND", "message": "not found"}})
 		return
 	}
@@ -347,4 +356,17 @@ func (s *Server) handleLogFile(w http.ResponseWriter, id string) {
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Write(body)
+}
+
+// DeleteEventLogFileBody makes downloads of one EventLogFile return 404 while
+// the record still appears in query results, as happens when a file expires.
+func (s *Server) DeleteEventLogFileBody(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.elfs {
+		if f.Id == id {
+			f.csv = nil
+			f.deleted = true
+		}
+	}
 }

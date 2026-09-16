@@ -81,19 +81,41 @@ func BuildRedisClient(conf *config.CacheConfig) (goredis.UniversalClient, error)
 	return redis.NewClient(RedisSettings(conf.Redis))
 }
 
+// BuildCache returns the configured cache. Without Redis it falls back to an
+// in-process cache: watermarks and de-duplication markers are then lost on
+// restart, but access tokens are still reused instead of re-authenticating on
+// every request.
 func BuildCache(conf *config.CacheConfig) (Cache, error) {
-	if conf == nil {
-		log.Warnf("No cache config")
-		return &DummyCache{}, nil
-	}
-	if conf.Redis == nil {
-		log.Warnf("No redis cache config")
-		return &DummyCache{}, nil
+	if conf == nil || conf.Redis == nil {
+		log.Warnf("No Redis configured: watermarks and de-duplication markers will not survive a restart")
+		return NewMemoryCache(), nil
 	}
 	log.Debugf("Using Redis cache")
 	redisDb, err := redis.NewRedisCache(RedisSettings(conf.Redis))
 	if err != nil {
 		return nil, err
 	}
+	if prefix := conf.Redis.KeyPrefix; prefix != "" {
+		return &prefixedCache{inner: &redisDb, prefix: prefix}, nil
+	}
 	return &redisDb, nil
+}
+
+// prefixedCache namespaces every key, so one Redis can serve several
+// deployments (keyPrefix applies to tokens, watermarks and markers, matching
+// the stream checkpoint store).
+type prefixedCache struct {
+	inner  Cache
+	prefix string
+}
+
+func (c *prefixedCache) GetCacheVal(key string) (any, error) {
+	return c.inner.GetCacheVal(c.prefix + key)
+}
+func (c *prefixedCache) SetCacheVal(key string, val any) error {
+	return c.inner.SetCacheVal(c.prefix+key, val)
+}
+func (c *prefixedCache) DelCacheVal(key string) error { return c.inner.DelCacheVal(c.prefix + key) }
+func (c *prefixedCache) SetPersistentVal(key string, val any) error {
+	return SetPersistent(c.inner, c.prefix+key, val)
 }
