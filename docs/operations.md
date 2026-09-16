@@ -80,6 +80,13 @@ stops every topic: the lease cannot be proven held, so continuing would risk two
 is deliberate. The restarted collectors resume from the last committed checkpoint and re-archive
 at most one batch per topic.
 
+A failover can also stop topics even when it is quick. ElastiCache replicates asynchronously, so
+the promoted replica may lack the most recent lease renewal or checkpoint write; the next commit
+then reports "checkpoint lease lost". In a test failover of the AWS stack this happened about 45
+seconds after the failover started. Nothing is lost: the checkpoint can only roll back to an
+earlier position, so the restarted collector re-archives the events since then (about 500
+duplicates per topic at 50 events per second in that test). De-duplicate on `event_id`.
+
 ### Stream collector stops with "authentication failed N times in a row"
 
 Five consecutive logins failed, or sessions were rejected before receiving any data, either at
