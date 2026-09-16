@@ -46,7 +46,8 @@ fi
 
 terraform init -input=false >/dev/null
 echo "==> creating ECR repository"
-terraform apply -no-color -input=false -auto-approve -target=aws_ecr_repository.this $TF_VARS
+# image_tag is required by the configuration, even for a targeted apply.
+terraform apply -no-color -input=false -auto-approve -target=aws_ecr_repository.this $TF_VARS -var image_tag="$TAG"
 
 REPO="$(terraform output -raw ecr_repository_url)"
 # <account>.dkr.ecr.<region>.amazonaws.com/<name>

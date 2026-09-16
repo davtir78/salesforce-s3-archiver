@@ -94,6 +94,22 @@ variable "object_lock_days" {
   description = "Retention period in days when object_lock_mode is set."
   type        = number
   default     = 365
+  validation {
+    condition     = var.object_lock_days >= 1 && floor(var.object_lock_days) == var.object_lock_days
+    error_message = "object_lock_days must be a whole number of at least 1."
+  }
+}
+
+variable "cache_key_prefix" {
+  description = "Prefix for every cache key (the collectors' cache.redis.keyPrefix), e.g. \"prod:\" to share one cache between deployments. The Valkey ACLs are derived from it, so the two cannot drift apart."
+  type        = string
+  default     = ""
+  validation {
+    # It is embedded in ACL key patterns, where glob and space characters
+    # would widen or break the pattern.
+    condition     = can(regex("^[A-Za-z0-9_:.-]*$", var.cache_key_prefix))
+    error_message = "cache_key_prefix may only contain letters, digits, '_', ':', '.' and '-'."
+  }
 }
 
 variable "noncurrent_version_days" {

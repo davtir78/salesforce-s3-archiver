@@ -78,3 +78,5 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
       - run: terraform -chdir=deploy/aws fmt -check -recursive
       - run: terraform -chdir=deploy/aws init -backend=false && terraform -chdir=deploy/aws validate
+      - name: deployment scripts
+        run: bash scripts/test-aws-run-task.sh

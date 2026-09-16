@@ -38,7 +38,7 @@ resource "aws_elasticache_user" "iam" {
   user_id       = "${var.name}-archiver-iam"
   user_name     = "${var.name}-archiver-iam"
   engine        = "valkey"
-  access_string = "on ~sfarch:* resetchannels +@read +@write +@scripting +@connection -@dangerous"
+  access_string = "on ~${var.cache_key_prefix}sfarch:* resetchannels +@read +@write +@scripting +@connection -@dangerous"
   authentication_mode {
     type = "iam"
   }
@@ -50,7 +50,7 @@ resource "aws_elasticache_user" "password" {
   user_id       = "${var.name}-archiver-pw"
   user_name     = "archiver"
   engine        = "valkey"
-  access_string = "on ~${local.instance}_* resetchannels +@read +@write +@connection -@dangerous"
+  access_string = "on ~${var.cache_key_prefix}${local.instance}_* resetchannels +@read +@write +@connection -@dangerous"
   authentication_mode {
     type      = "password"
     passwords = [random_password.cache_archiver.result]

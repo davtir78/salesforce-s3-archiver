@@ -260,6 +260,23 @@ Worth setting for production: `object_lock_mode` (write-once retention for archi
 a remote Terraform backend, since local state holds the generated cache secrets. See
 [deploy/aws/backend.tf.example](deploy/aws/backend.tf.example).
 
+Before enabling Object Lock, note how it interacts with the rest of the stack:
+
+- It can only be chosen when the bucket is created. Changing `object_lock_mode` later replaces
+  the bucket.
+- `COMPLIANCE` retention cannot be shortened or bypassed by anyone, including the account root.
+  `terraform destroy` (and `aws-destroy.sh`, even with `FORCE_DESTROY_BUCKET=true`) fails while
+  any object is still retained, so try the stack with `GOVERNANCE` or a short
+  `object_lock_days` first.
+- EventLogFile objects have deterministic keys (`elf-<Id>`), so a backfill that reprocesses a
+  file writes a new version and the previous one becomes a noncurrent version. Under Object
+  Lock that noncurrent version is also retained for `object_lock_days`, and is billed for that
+  period.
+
+To share one cache between deployments, set `cache_key_prefix` (for example `prod:`). It sets
+`cache.redis.keyPrefix` in both collector configs and the Valkey ACL key patterns together; set
+by hand, a prefix the ACLs do not allow would deny every cache operation.
+
 ## Development
 
 ```bash

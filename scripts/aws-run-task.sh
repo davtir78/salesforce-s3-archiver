@@ -28,34 +28,67 @@ SUBNETS=$($TF output -json subnets | tr -d '[]" \n')
 SG=$($TF output -raw task_security_group)
 export AWS_REGION=$REGION
 
-# json_string quotes a value for embedding in a JSON document.
+# json_string prints its argument as a JSON string literal. Arguments are flags
+# and topic names, so control characters are rejected rather than escaped.
 json_string() {
-  printf '%s' "$1" | awk 'BEGIN{ORS=""} {gsub(/\/,"\\\\"); gsub(/"/,"\\\""); print}'
+  case "$1" in
+    *[[:cntrl:]]*) echo "argument contains a control character: $1" >&2; return 1 ;;
+  esac
+  # Quoted patterns and replacements are literal on every bash version (5.2
+  # changed how unquoted backslashes in a replacement are processed).
+  local bs='\' dq='"' v
+  v=${1//"$bs"/"$bs$bs"}
+  v=${v//"$dq"/"$bs$dq"}
+  printf '"%s"' "$v"
 }
 
-OVERRIDES=/tmp/sfarchive-overrides.$$.json
+# json_args prints the arguments as comma-separated JSON strings.
+json_args() {
+  local out="" arg q
+  for arg in "$@"; do
+    q=$(json_string "$arg") || return 1
+    out="${out:+$out,}$q"
+  done
+  printf '%s' "$out"
+}
+
+OVERRIDES=$(mktemp)
 trap 'rm -f "$OVERRIDES"' EXIT
+OVERRIDE_ARGS=(--overrides "file://$OVERRIDES")
 
 if [ "$WHICH" = "verify" ]; then
   FAMILY=$($TF output -raw verify_task_definition)
   CONTAINER=verify
-  ARGS=""
-  for arg in "$@"; do ARGS="$ARGS,\"$(json_string "$arg")\""; done
-  printf '{"containerOverrides":[{"name":"%s","command":["%s"%s]}]}' "$CONTAINER" "$BIN" "$ARGS" > "$OVERRIDES"
+  if [ $# -eq 0 ]; then
+    # Run the task definition's command unchanged.
+    OVERRIDE_ARGS=()
+  else
+    # Extra flags are appended to the task definition's command, which carries
+    # -bucket, -prefix, -region and (for the mock) -ledger. Replacing it would
+    # drop them.
+    BASE=$(aws ecs describe-task-definition --task-definition "$FAMILY" \
+      --query 'taskDefinition.containerDefinitions[?name==`verify`].command | [0]' --output json | tr -d '\n\r')
+    case "$BASE" in
+      \[*\]) ;;
+      *) echo "could not read the verify task definition's command: $BASE" >&2; exit 1 ;;
+    esac
+    EXTRA=$(json_args "$@")
+    printf '{"containerOverrides":[{"name":"%s","command":%s,%s]}]}' "$CONTAINER" "${BASE%]}" "$EXTRA" > "$OVERRIDES"
+  fi
 else
   FAMILY="$CLUSTER-$WHICH"
   CONTAINER="$WHICH-collector"
-  # The config lives in the task definition's CONFIG_YAML; write it out, then
-  # run the requested command against it.
-  CMD="printf '%s' \"\$CONFIG_YAML\" > /tmp/config.yml && exec $BIN -config /tmp/config.yml"
-  for arg in "$@"; do CMD="$CMD $arg"; done
-  printf '{"containerOverrides":[{"name":"%s","command":["/bin/sh","-c","%s"]}]}' "$CONTAINER" "$(json_string "$CMD")" > "$OVERRIDES"
+  # with-config (in the image) writes the task definition's CONFIG_YAML to a
+  # file and runs the binary against it, so the override is a plain argument
+  # list with no shell quoting.
+  COMMAND=$(json_args with-config "$BIN" "$@")
+  printf '{"containerOverrides":[{"name":"%s","command":[%s]}]}' "$CONTAINER" "$COMMAND" > "$OVERRIDES"
 fi
 
 echo "==> running $BIN $* on $CLUSTER"
 ARN=$(aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --task-definition "$FAMILY" \
   --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=ENABLED}" \
-  --overrides "file://$OVERRIDES" --query 'tasks[0].taskArn' --output text)
+  ${OVERRIDE_ARGS[@]+"${OVERRIDE_ARGS[@]}"} --query 'tasks[0].taskArn' --output text)
 ID=${ARN##*/}
 aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$ARN"
 CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$ARN" --query 'tasks[0].containers[0].exitCode' --output text)

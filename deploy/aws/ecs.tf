@@ -70,6 +70,7 @@ locals {
         redis:
           host: ${local.cache_host}
           port: 6379
+          keyPrefix: "${var.cache_key_prefix}"
           tls:
             enabled: true
           iamAuth:
@@ -113,6 +114,7 @@ locals {
         redis:
           host: ${local.cache_host}
           port: 6379
+          keyPrefix: "${var.cache_key_prefix}"
           username: ${aws_elasticache_user.password.user_name}
           password: $REDIS_PASSWORD
           expireDays: 7
