@@ -266,3 +266,21 @@ func TestZeroTimestampsAreNotCounted(t *testing.T) {
 		t.Errorf("zero timestamps must not widen the manifest range: %v..%v", m.FirstTimestamp, m.LastTimestamp)
 	}
 }
+
+// A cancelled copy fails without leaving a partial object behind.
+func TestLocalSinkCopyHonoursCancellation(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := NewLocalSink(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = sink.atomicWrite("raw/obj.json.gz", ctxReader{ctx, strings.NewReader("data")})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "raw", "obj.json.gz")); !os.IsNotExist(statErr) {
+		t.Errorf("a cancelled write must not leave the object behind (stat: %v)", statErr)
+	}
+}

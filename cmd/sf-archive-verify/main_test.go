@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"testing"
 	"time"
 
@@ -57,5 +59,47 @@ func TestSameTime(t *testing.T) {
 	c := a.Add(time.Second)
 	if sameTime(&a, nil) || sameTime(nil, &a) || sameTime(&a, &c) {
 		t.Error("different times should not compare equal")
+	}
+}
+
+// The verifier must accept exactly what the writer produces, including records
+// with zero timestamps (left out of the manifest range) and objects where every
+// timestamp is zero (no range at all).
+func TestScanObjectMatchesWriterManifest(t *testing.T) {
+	sink := archive.NewMemorySink()
+	now := time.Date(2026, 9, 16, 10, 0, 0, 0, time.UTC)
+	meta := archive.ObjectMeta{Source: archive.SourceSOQL, OrgId: "00D", Instance: "test", EventType: "SetupAuditTrail", PartitionTime: now}
+	batches := map[string][]archive.Record{
+		"mixed": {
+			{Type: "SetupAuditTrail", Timestamp: time.Time{}, Id: "a", Payload: map[string]any{"Id": "a"}},
+			{Type: "SetupAuditTrail", Timestamp: now, Id: "b", Payload: map[string]any{"Id": "b"}},
+			{Type: "SetupAuditTrail", Timestamp: now.Add(time.Minute), Id: "c", Payload: map[string]any{"Id": "c"}},
+		},
+		"all zero": {
+			{Type: "SetupAuditTrail", Id: "d", Payload: map[string]any{"Id": "d"}},
+			{Type: "SetupAuditTrail", Id: "e", Payload: map[string]any{"Id": "e"}},
+		},
+	}
+	for name, records := range batches {
+		meta.PartitionTime = meta.PartitionTime.Add(time.Hour) // distinct keys
+		m, err := archive.WriteRecords(context.Background(), sink, meta, records)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		body, ok := sink.Objects()[m.ObjectKey]
+		if !ok {
+			t.Fatalf("%s: object %s not stored", name, m.ObjectKey)
+		}
+		var visited int
+		stats, err := scanObject(bytes.NewReader(body), func(archive.Line) { visited++ })
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if why := stats.compare(m); why != "" {
+			t.Errorf("%s: a consistent object failed verification: %s", name, why)
+		}
+		if visited != len(records) {
+			t.Errorf("%s: visited %d records, want %d", name, visited, len(records))
+		}
 	}
 }
