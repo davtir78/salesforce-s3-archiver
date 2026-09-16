@@ -31,6 +31,11 @@ Both collectors serve Prometheus metrics on `metricsAddr` (`/metrics`, `/healthz
 A stream collector that exits with an error is **meant** to be restarted by the orchestrator.
 Alert on restart loops: they indicate a condition that needs a human (see below).
 
+The AWS stack wires this up: an EventBridge rule publishes to an SNS topic whenever a task stops
+with a non-zero exit code, and CloudWatch alarms fire on the log lines `CHECKPOINT RESET`,
+`QUARANTINED`, `UNAVAILABLE EventLogFile` and `stored replay ID was rejected`. Set `alarm_email`
+to receive them.
+
 ## Recovery procedures
 
 ### Stream collector refuses to start: "no replay checkpoint exists"
@@ -84,6 +89,20 @@ Delete the query watermark key `<instanceName>_query_<hash>_last_run_ts` and set
 
 ## Verifying an archive
 
-`sf-archive-verify -bucket <bucket> -prefix <prefix>` checks every manifest against its object
-(record count, size, SHA-256) and exits non-zero on mismatches or objects without manifests.
-With `-ledger` it also reconciles against the mock org's ledger.
+`sf-archive-verify -bucket <bucket> -prefix <prefix>` streams every object and checks it against
+its manifest: record count, compressed and uncompressed size, SHA-256 and the first/last
+timestamps. It exits non-zero when a manifest does not match, when a manifest's data object is
+missing, or when an object could not be read.
+
+A data object with no manifest is reported but does not fail the run: it is normally a duplicate
+left behind by a failed manifest upload, which the collector re-archived. Pass `-strict` to fail
+on those too. With `-ledger` it also reconciles against the mock org ledger.
+
+On AWS the cache and archive are only reachable from inside the VPC, so run recovery commands as
+one-off tasks:
+
+```bash
+bash scripts/aws-run-task.sh stream -reset-checkpoints /event/LoginEventStream -confirm
+bash scripts/aws-run-task.sh eventlog -once
+bash scripts/aws-run-task.sh verify -strict
+```

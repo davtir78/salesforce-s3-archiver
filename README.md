@@ -1,19 +1,39 @@
 # salesforce-s3-archiver
 
-Archives Salesforce Event Monitoring data to Amazon S3 without silent data loss.
+Archives Salesforce Event Monitoring data to Amazon S3 as an immutable, queryable record,
+without silent data loss.
 
 It collects:
 
 - **Real-Time Event Monitoring streams** via the Salesforce Pub/Sub API (`sf-archive-stream`)
 - **EventLogFiles**, **custom SOQL query results** and **org limits** via the REST API (`sf-archive-eventlog`)
 
-and writes them to S3 as gzip-compressed NDJSON with a manifest per object.
+and writes them to S3 as gzip-compressed NDJSON, one object per batch or file, each with a manifest.
 
-This project is a hard fork of the Apache-2.0 licensed
-[newrelic/newrelic-salesforce-exporter](https://github.com/newrelic/newrelic-salesforce-exporter).
-The Salesforce collection code is derived from that project; the New Relic export path was
-replaced with an S3 archive and a number of data-loss bugs were fixed (see [below](#changes-from-upstream)).
-It is not affiliated with or endorsed by New Relic or Salesforce.
+## Why this fork exists
+
+This is a hard fork of the Apache-2.0 licensed
+[newrelic/newrelic-salesforce-exporter](https://github.com/newrelic/newrelic-salesforce-exporter),
+which sends Salesforce logs to New Relic for monitoring. The Salesforce-facing code (auth,
+Pub/Sub client, EventLogFile and SOQL queries) is derived from it. It is not affiliated with or
+endorsed by New Relic or Salesforce.
+
+The goals are different, and that difference matters:
+
+- **Monitoring tolerates gaps; an audit archive does not.** Upstream advanced its replay
+  checkpoint as each event arrived, before the event was exported, and discarded a whole batch
+  (logged at debug level) when export failed. Both lose events permanently. Here the checkpoint
+  only moves after the data is durably in S3.
+- **The destination is object storage, not a telemetry API.** The New Relic export path is
+  replaced with an S3 archive: partitioned keys, a manifest with a SHA-256 per object, and
+  server-side encryption. Upstream also refused to start without a New Relic licence key.
+- **Fail closed rather than carry on.** A missing or rejected replay checkpoint stops the
+  collector instead of silently restarting from "now", which would leave a gap nobody notices.
+- **Keep the data as Salesforce sent it.** Upstream truncated strings at 4096 characters,
+  converted numeric-looking values and dropped Avro fields it did not recognise.
+
+Other fixed data-loss bugs (descriptor leak, ignored pagination, watermarks advancing past
+failures) are listed under [Changes from upstream](#changes-from-upstream).
 
 ## Guarantees
 
@@ -21,14 +41,136 @@ It is not affiliated with or endorsed by New Relic or Salesforce.
 |---|---|---|
 | Pub/Sub streams | At-least-once | The replay checkpoint only advances after events are durably written to S3. Restarts may re-archive a batch; they never skip one. |
 | EventLogFiles | Idempotent | One object per file at a deterministic key (`elf-<Id>`). The watermark only moves past archived files. |
-| Custom SOQL queries | At-least-once | Watermark advances only after every object is written; overlapping windows are de-duplicated on `Id` + timestamp. |
+| Custom SOQL queries | At-least-once | The watermark advances only after every object is written; overlapping windows are de-duplicated on `Id` + timestamp. |
 
-Downstream consumers should de-duplicate on `EventIdentifier` (streams), `REQUEST_ID`/file Id (EventLogFiles) or `Id` + timestamp (SOQL).
+Duplicates are possible, loss is not. De-duplicate downstream on `event_id`.
 
-The stream collector **fails closed**: it refuses to start without a checkpoint unless
-`initialReplay` is set, stops if Salesforce rejects its stored replay ID (for example it is
-older than the retention window), and stops if its checkpoint lease is lost. Silently falling
-back to `LATEST` would hide data loss.
+The stream collector **fails closed**. It refuses to start without a checkpoint unless
+`initialReplay` is set, stops if Salesforce rejects its stored replay ID (for example it is older
+than the retention window), stops if its checkpoint lease is lost, and stops if it cannot write to
+S3. Each case is a condition a human needs to see; silently continuing would hide a gap.
+
+Two limits worth knowing:
+
+- Recovery depends on Salesforce retention. An outage longer than the Pub/Sub retention window
+  cannot be replayed; back-fill from EventLogFiles or stored event objects instead.
+- `initialReplay: LATEST` cannot guarantee events between subscribing and the first checkpoint.
+  Bootstrap with `EARLIEST` when that matters.
+
+## The record envelope
+
+Every line is a small envelope around the source record, unchanged, in `payload`:
+
+```json
+{"event_id":"9b2c7f4e","event_type":"LoginEventStream","timestamp":"2026-09-15T01:02:03.004Z",
+ "source":"stream","env":"prod","org_id":"00D...","instance":"myorg-prod","replay_id":"AAAAAAAAAmI=",
+ "payload":{"EventUuid":"9b2c7f4e","UserId":"005...","SourceIp":"10.0.4.7","...":"..."}}
+```
+
+| Field | Meaning |
+|---|---|
+| `event_id` | Salesforce event UUID (streams), record Id (SOQL), or a hash of file Id + line number (EventLogFile rows, which have no unique field of their own). The de-duplication key. |
+| `event_type` | `LoginEventStream`, `Login`, `SetupAuditTrail`, ... |
+| `timestamp` | Event time from the source, UTC |
+| `source` | `stream`, `eventlog`, `soql` or `limits` |
+| `env` | Deployment that collected the record, from config |
+| `org_id`, `instance` | Salesforce org, and the collector instance name |
+| `replay_id` | Pub/Sub replay position (streams only) |
+| `payload` | The original record, unchanged |
+
+Envelope keys are snake_case; payload keys keep the Salesforce spelling (`USER_ID`, `SourceIp`).
+Each object also has a manifest under a separate `manifests/` prefix recording the count, sizes,
+SHA-256, time range and lineage (topic and replay range, or EventLogFile Id). That manifest is
+what `sf-archive-verify` checks, and what gives any row a chain of custody back to an immutable
+object.
+
+## Why records are schema-neutral
+
+The collector never imposes a schema on the payload. It does not rename, reorder, coerce or drop
+fields, and it needs no field list per event type.
+
+- **Salesforce changes its schemas.** Event types gain fields every release, and each of the ~50
+  EventLogFile types has its own columns. Anything that enumerated fields would silently drop new
+  ones, which is exactly the upstream bug where every non-union Avro field was discarded.
+- **Values keep their original form.** CSV columns stay strings (`"157"`, not `157`), so leading
+  zeros, large IDs and oversized values survive; SOQL numbers keep full precision instead of
+  becoming float64; nothing is truncated.
+- **The evidence should be the raw record.** For an audit or investigation a normalised copy is a
+  derived artefact. Normalisation belongs downstream, where it can be changed and re-run without
+  re-reading Salesforce.
+- **Schema-on-read fits the query engine.** Athena and Glue can read the payload as a map, or
+  project only the columns of interest per event type, without the archive guessing in advance
+  which fields matter.
+
+The envelope carries the small, stable set of fields that have to be consistent to query across
+sources at all.
+
+## Querying with Athena
+
+The layout is designed for Athena over the `raw/` prefix (manifests live elsewhere, so they are
+never read as data):
+
+```text
+<prefix>/raw/source=<stream|eventlog|soql|limits>/org_id=<org>/event_type=<type>/year=YYYY/month=MM/day=DD/hour=HH/<name>.json.gz
+```
+
+Those are Hive-style partition keys, so a table with partition projection needs no crawler. Read
+the payload as a map and let each query pick out the fields it needs:
+
+```sql
+CREATE EXTERNAL TABLE salesforce_archive (
+  event_id   string,
+  event_type string,
+  ts         timestamp,
+  source     string,
+  env        string,
+  org_id     string,
+  instance   string,
+  replay_id  string,
+  payload    map<string,string>
+)
+PARTITIONED BY (year string, month string, day string, hour string)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+WITH SERDEPROPERTIES ('mapping.ts' = 'timestamp')
+LOCATION 's3://my-archive/salesforce/raw/source=eventlog/org_id=00D.../event_type=Login/'
+TBLPROPERTIES (
+  'projection.enabled' = 'true',
+  'projection.year.type' = 'integer',  'projection.year.range' = '2026,2030',
+  'projection.month.type' = 'integer', 'projection.month.range' = '01,12', 'projection.month.digits' = '2',
+  'projection.day.type' = 'integer',   'projection.day.range' = '01,31',   'projection.day.digits' = '2',
+  'projection.hour.type' = 'integer',  'projection.hour.range' = '00,23',  'projection.hour.digits' = '2'
+);
+```
+
+Typical investigator queries:
+
+```sql
+-- Everything one user did on one day
+SELECT ts, event_type, payload['CLIENT_IP'], payload['URI']
+FROM salesforce_archive
+WHERE year = '2026' AND month = '09' AND day = '15'
+  AND payload['USER_ID'] = '005xx000001Sv6AAAS'
+ORDER BY ts;
+
+-- Failed logins by source IP within an hour
+SELECT payload['CLIENT_IP'] AS ip, count(*) AS attempts
+FROM salesforce_archive
+WHERE year = '2026' AND month = '09' AND day = '15' AND hour = '02'
+  AND payload['LOGIN_STATUS'] <> 'LOGIN_NO_ERROR'
+GROUP BY 1
+ORDER BY attempts DESC;
+```
+
+Three things to know before scaling this up:
+
+- **Always filter on the partition columns.** Without them Athena scans the whole archive, and
+  cost grows with the archive rather than with the query.
+- **Partitions are ingestion time for streams and SOQL**, and `LogDate` for EventLogFiles. Event
+  time lives in `timestamp`. A question about "what happened on the 15th" should filter the
+  partitions generously, then filter on `timestamp`.
+- **Convert to Parquet for regular use.** JSON is the evidence copy: complete, immutable and slow
+  to scan. A compaction job into Parquet, partitioned by event date, is the intended path for
+  day-to-day analysis and is not built yet.
 
 ## Quick start (Docker, no Salesforce org needed)
 
@@ -87,25 +229,10 @@ lease stops before it can move the checkpoint.
 <prefix>/manifests/<same partition path>/<name>.manifest.json
 ```
 
-Stream and SOQL objects are partitioned by ingestion time and use unique names; EventLogFiles
-are partitioned by `LogDate` and named `elf-<Id>`.
-
-Each NDJSON line is an envelope around the unchanged source record:
-
-```json
-{"event_id":"9b2c7f4e","event_type":"LoginEventStream","timestamp":"2026-09-15T01:02:03.004Z",
- "source":"stream","env":"prod","org_id":"00D...","instance":"myorg-prod","replay_id":"AAAAAAAAAmI=",
- "payload":{"EventUuid":"9b2c7f4e","UserId":"005...","SourceIp":"10.0.4.7","...":"..."}}
-```
-
-`event_id` is the Salesforce event UUID for streams, the record Id for SOQL, and a hash of
-file Id plus line number for EventLogFile rows (whose rows have no unique field of their own).
-`env` comes from config; everything else is derived from the source. `payload` holds every
-original field unchanged.
-Manifests record the record count, sizes, SHA-256, first/last timestamp and lineage (topic and
-replay ID range, or EventLogFile Id).
-
-Manifests live under a separate prefix so Athena/Glue tables over `raw/` only see data.
+Stream and SOQL objects are partitioned by ingestion time and use unique names; EventLogFiles are
+partitioned by `LogDate` and named `elf-<Id>`, so reprocessing a file overwrites its own object.
+See [the record envelope](#the-record-envelope) for the line format and
+[querying with Athena](#querying-with-athena) for the table definition.
 
 ## Operations
 
@@ -118,15 +245,20 @@ including resetting a checkpoint after Salesforce rejects a replay ID.
 SSE-KMS, ElastiCache for Valkey (Multi-AZ, TLS, IAM and password RBAC users) and the mock org.
 
 ```bash
-bash scripts/aws-deploy.sh      # build, push and apply
-bash scripts/chaos-aws.sh       # chaos test with reconciliation
-CONFIRM_DESTROY=sfarchive-test bash scripts/aws-destroy.sh   # tear down (add FORCE_DESTROY_BUCKET=true to delete archived data)
+MOCK=1 bash scripts/aws-deploy.sh    # build, push and apply the mock test stack
+bash scripts/chaos-aws.sh            # chaos test with reconciliation
+bash scripts/aws-run-task.sh verify -strict          # one-off task inside the VPC
+CONFIRM_DESTROY=sfarchive-test bash scripts/aws-destroy.sh   # tear down (FORCE_DESTROY_BUCKET=true also deletes archived data)
 ```
 
-Terraform state is local by default and contains generated secrets; see
-[deploy/aws/backend.tf.example](deploy/aws/backend.tf.example) for remote state.
+For a real org, put the settings in `deploy/aws/terraform.tfvars` (gitignored) and the secret in
+`TF_VAR_salesforce_client_secret`; the deploy script refuses to run without an explicit mode, so
+it cannot silently point a real deployment back at the mock.
 
-To point it at a real org set `use_mock_salesforce=false` and the `salesforce_*` variables.
+Worth setting for production: `object_lock_mode` (write-once retention for archived evidence),
+`alarm_email` (task failures and the log alarms in [docs/operations.md](docs/operations.md)), and
+a remote Terraform backend, since local state holds the generated cache secrets. See
+[deploy/aws/backend.tf.example](deploy/aws/backend.tf.example).
 
 ## Development
 
@@ -134,7 +266,7 @@ To point it at a real org set `use_mock_salesforce=false` and the `salesforce_*`
 go test ./...                                  # unit, mock-org, crash-matrix and chaos tests
 go test -race ./...                            # requires cgo (or run in a golang container)
 S3_TEST_ENDPOINT=http://localhost:9000 S3_TEST_BUCKET=archive go test ./internal/archive
-REDIS_TEST_HOST=localhost REDIS_TEST_PORT=6379 go test ./internal/checkpoint
+REDIS_TEST_HOST=localhost REDIS_TEST_PORT=6379 go test ./internal/checkpoint ./internal/cache/...
 ```
 
 | Path | Purpose |

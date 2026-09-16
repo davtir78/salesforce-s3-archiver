@@ -78,7 +78,7 @@ locals {
             userId: ${aws_elasticache_user.iam.user_id}
             region: ${var.region}
     ${local.pubsub_config}
-      initialReplay: EARLIEST
+      initialReplay: ${var.use_mock_salesforce ? "EARLIEST" : var.stream_initial_replay}
       appetite: 100
       leaseTtlSeconds: 30
       shutdownFlushTimeoutSeconds: 90
@@ -173,21 +173,27 @@ resource "aws_ecs_task_definition" "stream" {
   cpu                      = "256"
   memory                   = "512"
   execution_role_arn       = aws_iam_role.execution.arn
-  task_role_arn            = aws_iam_role.collector.arn
+  task_role_arn            = aws_iam_role.stream.arn
   runtime_platform {
     cpu_architecture        = "X86_64"
     operating_system_family = "LINUX"
   }
   container_definitions = jsonencode([{
-    name             = "stream-collector"
-    image            = local.image
-    essential        = true
-    entryPoint       = ["/bin/sh", "-c"]
-    command          = ["printf '%s' \"$CONFIG_YAML\" > /tmp/config.yml && exec sf-archive-stream -config /tmp/config.yml"]
-    stopTimeout      = 120 # Fargate maximum; above shutdownFlushTimeoutSeconds (90)
-    environment      = [{ name = "CONFIG_YAML", value = local.stream_config }]
-    secrets          = [{ name = "SF_CLIENT_SECRET", valueFrom = aws_ssm_parameter.sf_client_secret.arn }]
-    portMappings     = [{ containerPort = 9090 }]
+    name         = "stream-collector"
+    image        = local.image
+    essential    = true
+    command      = ["with-config", "sf-archive-stream"]
+    stopTimeout  = 120 # Fargate maximum; above shutdownFlushTimeoutSeconds (90)
+    environment  = [{ name = "CONFIG_YAML", value = local.stream_config }]
+    secrets      = [{ name = "SF_CLIENT_SECRET", valueFrom = aws_ssm_parameter.sf_client_secret.arn }]
+    portMappings = [{ containerPort = 9090 }]
+    healthCheck = {
+      command     = ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9090/healthz || exit 1"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 30
+    }
     logConfiguration = local.log_config
   }])
 }
@@ -208,15 +214,21 @@ resource "aws_ecs_task_definition" "eventlog" {
     name        = "eventlog-collector"
     image       = local.image
     essential   = true
-    entryPoint  = ["/bin/sh", "-c"]
-    command     = ["printf '%s' \"$CONFIG_YAML\" > /tmp/config.yml && exec sf-archive-eventlog -config /tmp/config.yml"]
+    command     = ["with-config", "sf-archive-eventlog"]
     stopTimeout = 120 # Fargate maximum; above shutdownFlushTimeoutSeconds (90)
     environment = [{ name = "CONFIG_YAML", value = local.eventlog_config }]
     secrets = [
       { name = "SF_CLIENT_SECRET", valueFrom = aws_ssm_parameter.sf_client_secret.arn },
       { name = "REDIS_PASSWORD", valueFrom = aws_ssm_parameter.cache_password.arn },
     ]
-    portMappings     = [{ containerPort = 9090 }]
+    portMappings = [{ containerPort = 9090 }]
+    healthCheck = {
+      command     = ["CMD-SHELL", "wget -q -O - http://127.0.0.1:9090/healthz || exit 1"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 30
+    }
     logConfiguration = local.log_config
   }])
 }
@@ -285,6 +297,10 @@ resource "aws_ecs_service" "stream" {
   launch_type                        = "FARGATE"
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
   network_configuration {
     subnets          = local.network.subnets
     security_groups  = local.network.security_groups
@@ -301,6 +317,10 @@ resource "aws_ecs_service" "eventlog" {
   launch_type                        = "FARGATE"
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
   network_configuration {
     subnets          = local.network.subnets
     security_groups  = local.network.security_groups
